@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/quickstart.gif" alt="recall in 30 seconds: collection add → index → search returns bolded matches" width="900">
+  <img src="assets/quickstart.gif" alt="recall in under a minute: collection add → index → search 'circuit breaker' (bolded matches) → get a single doc → recall doctor → recall status" width="900">
 </p>
 
 ---
