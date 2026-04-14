@@ -129,7 +129,12 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           NOTES="$(git for-each-ref --format='%(contents)' refs/tags/$TAG | head -200)"
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # Existing release found. Refresh assets AND make sure it's
+            # published — `gh release view` matches drafts too, and a
+            # previously-orphaned draft (from a tag delete + repush) would
+            # otherwise stay hidden from the public releases page.
             gh release upload "$TAG" release/* --clobber
+            gh release edit   "$TAG" --draft=false --notes "$NOTES" --title "recall $TAG"
           else
             gh release create "$TAG" release/* \
               --title "recall $TAG" \
