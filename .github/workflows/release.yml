@@ -1,58 +1,50 @@
 name: Release
 
-# Triggered when a maintainer pushes a `v*.*.*` tag.
+# Triggered by tag push OR by manual re-run against an existing tag.
 on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to re-release (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
-  contents: write   # to create the GitHub release
-  packages: write   # in case we ever publish container images
+  contents: write
+
+env:
+  # Where the version metadata gets stamped via -ldflags.
+  PKG: github.com/ugurcan-aytar/recall/internal/commands
 
 jobs:
-  # Build the per-platform binaries on native runners (CGo can't
-  # cross-compile between OSes), upload them as artefacts, then let a
-  # final job assemble the GitHub release + Homebrew tap PR.
+  # ---------- per-platform native builds (CGo can't cross-compile OS) ----------
   build:
-    name: build (${{ matrix.os }})
+    name: build (${{ matrix.label }})
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: linux_amd64
+            goos: linux
+            goarch: amd64
+          - os: macos-13            # last Intel macOS runner
+            label: darwin_amd64
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest        # arm64 (M-series)
+            label: darwin_arm64
+            goos: darwin
+            goarch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # goreleaser needs full history for changelog
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: goreleaser (snapshot, host OS only)
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: latest
-          args: release --snapshot --clean --skip=publish --skip=homebrew --skip=announce
-
-      - name: Upload dist artefacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ matrix.os }}
-          path: dist/
-
-  publish:
-    name: publish release + brew tap
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Set up Go
@@ -61,28 +53,165 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Pull per-platform artefacts
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Build recall
+        env:
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          set -euxo pipefail
+          OUTDIR="recall_${{ steps.ver.outputs.version }}_${{ matrix.label }}"
+          mkdir -p "$OUTDIR"
+          go build -tags sqlite_fts5 \
+            -ldflags "-s -w \
+              -X $PKG.Version=${{ steps.ver.outputs.tag }} \
+              -X $PKG.Commit=${{ steps.ver.outputs.commit }} \
+              -X $PKG.BuildDate=${{ steps.ver.outputs.date }}" \
+            -o "$OUTDIR/recall" ./cmd/recall
+          cp README.md LICENSE CHANGELOG.md "$OUTDIR/"
+          tar -czf "${OUTDIR}.tar.gz" "$OUTDIR"
+          ls -la "${OUTDIR}.tar.gz"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: recall_*_${{ matrix.label }}.tar.gz
+          if-no-files-found: error
+
+  # ---------- assemble release + write homebrew formula -----------------------
+  release:
+    name: publish release + brew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pull all platform tarballs
         uses: actions/download-artifact@v4
         with:
-          path: dist/
+          path: artefacts/
 
-      - name: Flatten dist/
+      - name: Stage release files + checksums
         run: |
-          mkdir -p dist-merged
-          # goreleaser snapshot produces dist/recall_..._linux_amd64/recall etc.
-          # Move them to a single directory the publish step understands.
-          find dist/ -type f \( -name "recall" -o -name "recall.exe" -o -name "*.tar.gz" -o -name "checksums.txt" \) -exec cp -v {} dist-merged/ \;
-          ls -la dist-merged/
+          set -euxo pipefail
+          mkdir -p release
+          find artefacts/ -name "*.tar.gz" -exec cp -v {} release/ \;
+          cd release
+          shasum -a 256 *.tar.gz > checksums.txt
+          cat checksums.txt
+          ls -la
 
-      - name: goreleaser publish
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: latest
-          args: release --clean
+      - name: Create / update GitHub release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Personal access token with `repo` scope on
-          # ugurcan-aytar/homebrew-recall. Set in repo Settings → Secrets.
-          # If unset, the brews: stanza in .goreleaser.yaml will fail —
-          # use --skip=homebrew on first release if you haven't set it up.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          NOTES="$(git for-each-ref --format='%(contents)' refs/tags/$TAG | head -200)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* \
+              --title "recall $TAG" \
+              --notes "$NOTES"
+          fi
+
+      - name: Push Homebrew formula
+        env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euxo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN secret not set — skipping brew tap push."
+            exit 0
+          fi
+          TAG="${{ steps.ver.outputs.tag }}"
+          VER="${{ steps.ver.outputs.version }}"
+
+          SHA_LIN_AMD=$(grep "linux_amd64"  release/checksums.txt | awk '{print $1}')
+          SHA_DAR_AMD=$(grep "darwin_amd64" release/checksums.txt | awk '{print $1}')
+          SHA_DAR_ARM=$(grep "darwin_arm64" release/checksums.txt | awk '{print $1}')
+          BASE_URL="https://github.com/ugurcan-aytar/recall/releases/download/${TAG}"
+
+          cat > /tmp/recall.rb <<EOF
+          # Auto-generated by recall release workflow. Do not edit by hand.
+          class Recall < Formula
+            desc "Local search engine for your notes and documents (BM25 + vector + hybrid fusion)"
+            homepage "https://github.com/ugurcan-aytar/recall"
+            version "${VER}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE_URL}/recall_${VER}_darwin_arm64.tar.gz"
+                sha256 "${SHA_DAR_ARM}"
+              end
+              on_intel do
+                url "${BASE_URL}/recall_${VER}_darwin_amd64.tar.gz"
+                sha256 "${SHA_DAR_AMD}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${BASE_URL}/recall_${VER}_linux_amd64.tar.gz"
+                sha256 "${SHA_LIN_AMD}"
+              end
+            end
+
+            def install
+              bin.install "recall"
+            end
+
+            def caveats
+              <<~EOS
+                recall is installed without the local GGUF embedding backend
+                (~146 MB model). To enable vector / hybrid search, either:
+                  * rebuild from source with -tags 'sqlite_fts5 embed_llama'
+                    (requires libbinding.a — see github.com/ugurcan-aytar/recall),
+                  * or set RECALL_EMBED_PROVIDER=openai|voyage and an API key.
+
+                BM25 full-text search via 'recall search' works out of the box.
+              EOS
+            end
+
+            test do
+              system "#{bin}/recall", "version"
+            end
+          end
+          EOF
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/ugurcan-aytar/homebrew-recall.git" /tmp/tap
+          mkdir -p /tmp/tap/Formula
+          cp /tmp/recall.rb /tmp/tap/Formula/recall.rb
+          cd /tmp/tap
+          git config user.name  "recall release bot"
+          git config user.email "noreply@github.com"
+          git add Formula/recall.rb
+          if git diff --cached --quiet; then
+            echo "tap formula unchanged; nothing to push"
+          else
+            git commit -m "recall ${VER}"
+            git push origin main
+          fi
