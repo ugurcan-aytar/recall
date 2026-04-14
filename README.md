@@ -55,26 +55,33 @@ Knowledge-base search usually pushes you toward a hosted vector DB, a Node or Py
 
 recall is designed to be boring infrastructure for your notes. Index once, search forever.
 
-## Quick start (with bundled examples)
-
-The repo ships an `examples/` folder of made-up meeting notes, a runbook, a journal entry, and an incident report so you can try recall without pointing it at your own data.
+## Quick start
 
 ```bash
-# 1. Install (see "Installation" below if `go install` doesn't work for you)
+# 1. Install
+brew install ugurcan-aytar/recall/recall    # or grab a binary from releases
+
+# 2. Point recall at a folder of notes
+recall collection add ~/notes --name notes  # or any folder of .md / .txt files
+recall index
+
+# 3. Full-text search (works immediately, no model needed)
+recall search "rate limiter"
+
+# 4. (Optional) hybrid BM25 + vector — needs an embedding backend
+export RECALL_EMBED_PROVIDER=openai
+export OPENAI_API_KEY=sk-…
+recall embed
+recall query "what did we decide about the launch date" --explain
+```
+
+Want to try recall without pointing it at your own data? Clone the repo and use the bundled `examples/` folder of fictional meeting notes, runbook, journal, and incident report:
+
+```bash
 git clone https://github.com/ugurcan-aytar/recall.git
-cd recall
-make build              # produces ./recall
-
-# 2. Index the bundled examples
-./recall collection add ./examples --name notes
-./recall index
-
-# 3. Full-text search (BM25 — works immediately, no model needed)
-./recall search "rate limiter"
-
-# 4. (Optional) generate vector embeddings + run hybrid search
-./recall embed          # ~146 MB model auto-downloads on first run
-./recall query "what did we decide about the launch date" --explain
+recall collection add ./recall/examples --name demo
+recall index
+recall search "circuit breaker"
 ```
 
 To use recall on your own notes, replace `./examples` with `~/notes` (or wherever your markdown lives).
@@ -212,13 +219,11 @@ The pieces:
 
 ## Installation
 
-### Pre-built binary (recommended)
+### Homebrew (macOS, Linux)
 
-Download from the [GitHub releases page](https://github.com/ugurcan-aytar/recall/releases) once the first release ships. Pre-built binaries already include the `sqlite_fts5` build tag.
-
-### Homebrew
-
-Coming with the first release (`brew install ugurcan-aytar/recall/recall`).
+```bash
+brew install ugurcan-aytar/recall/recall
+```
 
 ### One-line install script
 
@@ -226,35 +231,46 @@ Coming with the first release (`brew install ugurcan-aytar/recall/recall`).
 curl -fsSL https://raw.githubusercontent.com/ugurcan-aytar/recall/main/install.sh | bash
 ```
 
-Coming with the first release. The script downloads the right pre-built binary for your OS / arch from the GitHub release.
+The script picks the right pre-built tarball for your OS / arch from the [latest release](https://github.com/ugurcan-aytar/recall/releases/latest), verifies its SHA-256, and installs to `/usr/local/bin` (root) or `~/.local/bin` (user).
+
+### Pre-built binary
+
+Grab a tarball directly from the [releases page](https://github.com/ugurcan-aytar/recall/releases/latest), extract it, and drop the `recall` binary anywhere on your `$PATH`. Currently shipped: `darwin_arm64`, `linux_amd64`. SHA-256 sums in `checksums.txt`.
 
 ### From source
+
+For contributors and anyone on a platform without a pre-built binary:
 
 ```bash
 git clone https://github.com/ugurcan-aytar/recall.git
 cd recall
-make build         # = go build -tags sqlite_fts5 -ldflags ... -o recall ./cmd/recall
+make build         # → ./recall
 ```
 
-Requires Go 1.24+ with CGo enabled (the default).
+Requires Go 1.24+ with CGo enabled (the default). If you `go install` instead of cloning, you need the `sqlite_fts5` tag — recall hard-fails with an actionable error otherwise:
 
-> **Important — `go install` needs the build tag.** recall uses SQLite's FTS5 module, which `mattn/go-sqlite3` gates behind the `sqlite_fts5` tag. If you `go install github.com/ugurcan-aytar/recall/cmd/recall@latest` without the tag, the binary builds successfully but every database command fails with a clear error pointing you back here. The right invocation is:
->
-> ```bash
-> go install -tags sqlite_fts5 github.com/ugurcan-aytar/recall/cmd/recall@latest
-> ```
+```bash
+go install -tags sqlite_fts5 github.com/ugurcan-aytar/recall/cmd/recall@latest
+```
 
-### Local embedding (optional)
+## Vector / hybrid search (optional)
 
-Vector search needs an embedding backend. The default is a local GGUF model and is gated behind a second build tag (`embed_llama`) plus a one-time `libbinding.a` build because it links llama.cpp. The recipe lives in [CONTRIBUTING.md](CONTRIBUTING.md); skip it and use BM25-only if you don't need semantic search.
+`recall search` (BM25 full-text) works the moment you install — no model, no API. `recall vsearch` and `recall query` need an **embedding backend**. Pick whichever fits how you installed:
 
-If you'd rather call out to an API:
+**Brew / pre-built users**: the bottle ships **without** the local GGUF model (~146 MB on disk, won't fit in a tap). Use an API:
 
 ```bash
 export RECALL_EMBED_PROVIDER=openai     # or voyage
 export OPENAI_API_KEY=sk-…              # or VOYAGE_API_KEY
 recall embed
+recall query "your question"
 ```
+
+`RECALL_EMBED_PROVIDER` defaults to `local`, so the API path is opt-in only — recall never sends data anywhere unless you explicitly set the env var.
+
+**Source builds**: rebuild with the `embed_llama` tag to get the in-process GGUF embedder. The recipe (libbinding.a, model download) is in [CONTRIBUTING.md](CONTRIBUTING.md). Once built, `recall models download` fetches the default model and `recall embed` runs entirely on-device.
+
+Run `recall doctor` any time to see which backend the current binary will use.
 
 ## Configuration
 
