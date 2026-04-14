@@ -235,23 +235,30 @@ func TestSearchBM25SanitizesUserQuestions(t *testing.T) {
 
 func TestSanitizeFTSQuery(t *testing.T) {
 	cases := []struct {
-		in, want string
+		name, in, want string
 	}{
-		{"auth", "auth"},
-		{"What did the team decide about authentication?", "What did the team decide about authentication"},
-		{"auth*", "auth"},
-		{"auth OR rate", "auth or rate"},
-		{"AND", "and"},
-		{"NEAR foo", "near foo"},
-		{"  \t\n  ", ""},
-		{"hello world!", "hello world"},
-		{"rate-limit", "rate limit"},
-		{"naïve café", "naïve café"}, // unicode letters preserved
+		{"single token passes through", "auth", "auth"},
+		{"short query keeps stopwords", "is rate", "is rate"}, // 2 tokens, filter skipped
+		{"short query — 3 tokens kept intact", "the rate limit", "the rate limit"},
+		{"long query drops stopwords", "What did the team decide about authentication?", "team decide about authentication"},
+		{"natural-language chat question", "what's the circuit breaker recovery pattern", "circuit breaker recovery pattern"},
+		{"contractions via punctuation strip", "don't block the rate limiter path", "block rate limiter path"},
+		{"strips fts5 operators", "auth*", "auth"},
+		{"OR keyword lowercased", "auth OR rate", "auth or rate"},
+		{"standalone AND", "AND", "and"},
+		{"NEAR keyword lowercased", "NEAR foo", "near foo"},
+		{"whitespace only", "  \t\n  ", ""},
+		{"hyphen becomes space", "rate-limit breaker pattern docs", "rate limit breaker pattern docs"},
+		{"unicode letters preserved", "naïve café approach", "naïve café approach"},
+		{"turkish question drops fillers", "neden rate limiter için bir circuit breaker gerekli", "neden rate limiter circuit breaker gerekli"},
+		{"all-stopword query falls back to unfiltered", "what is the a or", "what is the a or"}, // every token is a stopword → filter empties → fall back to unfiltered
 	}
 	for _, tc := range cases {
-		got := sanitizeFTSQuery(tc.in)
-		if got != tc.want {
-			t.Errorf("sanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeFTSQuery(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }

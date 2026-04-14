@@ -7,18 +7,32 @@ import (
 	"unicode"
 )
 
-// sanitizeFTSQuery rewrites a user-typed query into an FTS5-safe MATCH
-// expression. Raw user input often contains punctuation that FTS5
-// treats as query operators — "?", ":", "*", apostrophes, parens, the
-// uppercase AND / OR / NOT / NEAR keywords — and passing any of those
-// through verbatim produces cryptic "fts5: syntax error" failures
-// instead of retrieval results.
+// sanitizeFTSQuery rewrites a user-typed query into an FTS5-safe
+// MATCH expression. Raw user input has two classes of problem:
 //
-// The sanitiser replaces every non-word rune with a space (FTS5 reads
-// space-separated barewords as an implicit-AND term list), then
-// lowercases any surviving AND/OR/NOT/NEAR token so FTS5 treats them
-// as literal terms rather than operators. Unicode letters and digits
-// pass through unchanged so non-ASCII corpora keep working.
+//  1. Punctuation FTS5 reads as operators ("?", ":", "*", apostrophes,
+//     parens, uppercase AND / OR / NOT / NEAR) — passing through
+//     verbatim produces cryptic "fts5: syntax error" failures.
+//  2. Natural-language noise ("what is", "how can I", "the", "a")
+//     that FTS5's implicit-AND then demands every doc must contain.
+//     A chat-style question like "what's the circuit breaker pattern"
+//     fans out to seven required terms — no single chunk contains all
+//     seven, so retrieval returns zero hits even though the corpus
+//     has an obvious match.
+//
+// The sanitiser handles (1) by replacing every non-word rune with a
+// space (FTS5 reads space-separated barewords as implicit AND) and
+// lowercasing surviving AND/OR/NOT/NEAR. It handles (2) by dropping
+// common stopwords in English + Turkish (the two languages recall
+// actively supports) once the query has more than three tokens —
+// short queries are treated as precise keyword searches and pass
+// through untouched.
+//
+// If stopword filtering would leave the query empty (e.g. the user
+// literally typed "the"), we fall back to the unfiltered token list
+// so BM25 still runs rather than returning an "empty query" error.
+// Unicode letters / digits pass through unchanged so non-ASCII
+// corpora keep working.
 func sanitizeFTSQuery(q string) string {
 	var b strings.Builder
 	b.Grow(len(q))
@@ -37,7 +51,60 @@ func sanitizeFTSQuery(q string) string {
 			fields[i] = strings.ToLower(f)
 		}
 	}
-	return strings.Join(fields, " ")
+	// Only filter stopwords on longer queries. "rate limit" and
+	// "auth flow" are precise 2-token searches; we don't want the
+	// sanitiser second-guessing those. Natural-language questions
+	// start to benefit at around 4+ tokens.
+	if len(fields) <= 3 {
+		return strings.Join(fields, " ")
+	}
+	filtered := fields[:0:len(fields)]
+	for _, f := range fields {
+		if _, isStop := ftsStopwords[strings.ToLower(f)]; isStop {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	if len(filtered) == 0 {
+		return strings.Join(fields, " ")
+	}
+	return strings.Join(filtered, " ")
+}
+
+// ftsStopwords is the union of English + Turkish fillers we drop from
+// 4-plus-token queries before handing them to FTS5. Keeps the list
+// tight — content words (nouns, verbs, adjectives) and
+// domain-specific jargon stay. Extending this set is a semver-patch
+// event; removing an entry is semver-minor because it changes recall
+// behaviour on existing queries.
+var ftsStopwords = map[string]struct{}{
+	// English fillers.
+	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {}, "be": {}, "but": {},
+	"by": {}, "can": {}, "could": {}, "did": {}, "do": {}, "does": {}, "for": {},
+	"from": {}, "had": {}, "has": {}, "have": {}, "he": {}, "her": {}, "here": {},
+	"his": {}, "how": {}, "i": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {},
+	"its": {}, "me": {}, "my": {}, "not": {}, "now": {}, "of": {}, "on": {}, "or": {},
+	"our": {}, "out": {}, "she": {}, "so": {}, "than": {}, "that": {},
+	"the": {}, "their": {}, "them": {}, "then": {}, "there": {}, "these": {},
+	"they": {}, "this": {}, "those": {}, "to": {}, "too": {}, "up": {}, "us": {},
+	"was": {}, "we": {}, "were": {}, "what": {}, "when": {}, "where": {}, "which": {},
+	"while": {}, "who": {}, "why": {}, "will": {}, "with": {}, "would": {}, "you": {},
+	"your": {},
+	// Contraction leftovers after the non-word strip — "don't" becomes
+	// "don t", "what's" becomes "what s", "we'll" becomes "we ll", etc.
+	// These roots and enclitics are almost never genuine search terms
+	// (a programmer grepping for "don" is vanishingly rare vs "don't"
+	// noise), so we drop them.
+	"ain": {}, "aren": {}, "couldn": {}, "didn": {}, "doesn": {}, "don": {},
+	"hadn": {}, "hasn": {}, "haven": {}, "isn": {}, "shouldn": {}, "wasn": {},
+	"weren": {}, "won": {}, "wouldn": {},
+	"d": {}, "ll": {}, "m": {}, "re": {}, "s": {}, "t": {}, // "ve" handled in the Turkish section below (same literal covers both languages).
+	// Turkish fillers. Kept minimal; brain's classifier already lowercases
+	// queries before reaching here, so case folding isn't needed.
+	"bir": {}, "bu": {}, "çok": {}, "da": {}, "daha": {}, "de": {}, "en": {},
+	"için": {}, "ile": {}, "ki": {}, "kim": {}, "mi": {}, "mı": {}, "mu": {},
+	"mü": {}, "ne": {}, "ni": {}, "nin": {}, "o": {}, "şu": {}, "ve": {},
+	"veya": {}, "ya": {},
 }
 
 // splitCollections normalises an [SearchOptions.Collection] value into a
