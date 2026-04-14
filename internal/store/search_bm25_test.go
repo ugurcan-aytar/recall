@@ -240,7 +240,7 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		{"single token passes through", "auth", "auth"},
 		{"short query keeps stopwords", "is rate", "is rate"}, // 2 tokens, filter skipped
 		{"short query — 3 tokens kept intact", "the rate limit", "the rate limit"},
-		{"long query drops stopwords", "What did the team decide about authentication?", "team decide about authentication"},
+		{"long query drops stopwords", "What did the team decide about authentication?", "team decide authentication"},
 		{"natural-language chat question", "what's the circuit breaker recovery pattern", "circuit breaker recovery pattern"},
 		{"contractions via punctuation strip", "don't block the rate limiter path", "block rate limiter path"},
 		{"strips fts5 operators", "auth*", "auth"},

@@ -78,18 +78,24 @@ func sanitizeFTSQuery(q string) string {
 // event; removing an entry is semver-minor because it changes recall
 // behaviour on existing queries.
 var ftsStopwords = map[string]struct{}{
-	// English fillers.
-	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {}, "be": {}, "but": {},
-	"by": {}, "can": {}, "could": {}, "did": {}, "do": {}, "does": {}, "for": {},
-	"from": {}, "had": {}, "has": {}, "have": {}, "he": {}, "her": {}, "here": {},
-	"his": {}, "how": {}, "i": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {},
-	"its": {}, "me": {}, "my": {}, "not": {}, "now": {}, "of": {}, "on": {}, "or": {},
-	"our": {}, "out": {}, "she": {}, "so": {}, "than": {}, "that": {},
-	"the": {}, "their": {}, "them": {}, "then": {}, "there": {}, "these": {},
-	"they": {}, "this": {}, "those": {}, "to": {}, "too": {}, "up": {}, "us": {},
-	"was": {}, "we": {}, "were": {}, "what": {}, "when": {}, "where": {}, "which": {},
-	"while": {}, "who": {}, "why": {}, "will": {}, "with": {}, "would": {}, "you": {},
-	"your": {},
+	// English fillers — articles, prepositions, auxiliaries, common
+	// question words, and the most frequent query-time fillers. Content
+	// words (nouns, verbs, adjectives) stay.
+	"a": {}, "about": {}, "after": {}, "all": {}, "an": {}, "and": {}, "any": {},
+	"are": {}, "as": {}, "at": {}, "be": {}, "been": {}, "before": {}, "being": {},
+	"both": {}, "but": {}, "by": {}, "can": {}, "could": {}, "did": {}, "do": {},
+	"does": {}, "during": {}, "each": {}, "for": {}, "from": {}, "had": {}, "has": {},
+	"have": {}, "having": {}, "he": {}, "her": {}, "here": {}, "his": {}, "how": {},
+	"i": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {}, "its": {}, "just": {},
+	"me": {}, "more": {}, "most": {}, "my": {}, "no": {}, "nor": {}, "not": {},
+	"now": {}, "of": {}, "off": {}, "on": {}, "once": {}, "only": {}, "or": {},
+	"other": {}, "our": {}, "out": {}, "over": {}, "own": {}, "same": {}, "she": {},
+	"should": {}, "so": {}, "some": {}, "such": {}, "than": {}, "that": {}, "the": {},
+	"their": {}, "them": {}, "then": {}, "there": {}, "these": {}, "they": {},
+	"this": {}, "those": {}, "through": {}, "to": {}, "too": {}, "under": {},
+	"until": {}, "up": {}, "us": {}, "very": {}, "was": {}, "we": {}, "were": {},
+	"what": {}, "when": {}, "where": {}, "which": {}, "while": {}, "who": {},
+	"why": {}, "will": {}, "with": {}, "would": {}, "you": {}, "your": {},
 	// Contraction leftovers after the non-word strip — "don't" becomes
 	// "don t", "what's" becomes "what s", "we'll" becomes "we ll", etc.
 	// These roots and enclitics are almost never genuine search terms
