@@ -31,14 +31,13 @@ jobs:
             label: linux_amd64
             goos: linux
             goarch: amd64
-          - os: macos-13            # last Intel macOS runner
-            label: darwin_amd64
-            goos: darwin
-            goarch: amd64
           - os: macos-latest        # arm64 (M-series)
             label: darwin_arm64
             goos: darwin
             goarch: arm64
+          # darwin_amd64 (Intel Mac) and linux_arm64 deferred to a later
+          # release: macos-13 runner isn't available on this account, and
+          # linux_arm64 needs cross-compile tooling (zigcc / qemu).
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -150,7 +149,6 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
 
           SHA_LIN_AMD=$(grep "linux_amd64"  release/checksums.txt | awk '{print $1}')
-          SHA_DAR_AMD=$(grep "darwin_amd64" release/checksums.txt | awk '{print $1}')
           SHA_DAR_ARM=$(grep "darwin_arm64" release/checksums.txt | awk '{print $1}')
           BASE_URL="https://github.com/ugurcan-aytar/recall/releases/download/${TAG}"
 
@@ -163,13 +161,12 @@ jobs:
             license "MIT"
 
             on_macos do
+              # darwin_amd64 (Intel Mac) build is not yet shipped — the
+              # macos-13 runner isn't available on the release workflow's
+              # account. M-series users are covered.
               on_arm do
                 url "${BASE_URL}/recall_${VER}_darwin_arm64.tar.gz"
                 sha256 "${SHA_DAR_ARM}"
-              end
-              on_intel do
-                url "${BASE_URL}/recall_${VER}_darwin_amd64.tar.gz"
-                sha256 "${SHA_DAR_AMD}"
               end
             end
 
