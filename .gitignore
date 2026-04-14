@@ -1,5 +1,6 @@
 # Binaries — anchor to repo root so cmd/recall/ and pkg/recall/ aren't ignored.
 /recall
+/demos/recall
 *.exe
 *.dll
 *.so

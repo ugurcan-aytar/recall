@@ -1,13 +1,24 @@
-# recall
+<p align="center">
+  <img src="assets/logo.svg" alt="recall" width="420">
+</p>
 
-**Local search engine for your notes and documents.**
-Markdown, plain text, meeting transcripts, knowledge bases. BM25 + vector + hybrid fusion in a single Go binary.
+<p align="center">
+  <strong>Local search engine for your notes and documents.</strong><br>
+  Markdown, plain text, meeting transcripts, knowledge bases.<br>
+  BM25 + vector + hybrid fusion in a single Go binary.
+</p>
 
-[![Go](https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go)](https://go.dev)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg)](#installation)
-[![CI](https://github.com/ugurcan-aytar/recall/actions/workflows/ci.yml/badge.svg)](https://github.com/ugurcan-aytar/recall/actions/workflows/ci.yml)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+<p align="center">
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go" alt="Go 1.24+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License"></a>
+  <a href="#installation"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue.svg" alt="Platforms"></a>
+  <a href="https://github.com/ugurcan-aytar/recall/actions/workflows/ci.yml"><img src="https://github.com/ugurcan-aytar/recall/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome"></a>
+</p>
+
+<p align="center">
+  <img src="assets/quickstart.gif" alt="recall in 30 seconds: collection add → index → search returns bolded matches" width="900">
+</p>
 
 ---
 
@@ -72,31 +83,27 @@ To use recall on your own notes, replace `./examples` with `~/notes` (or whereve
 
 recall implements the same retrieval pipeline most modern hybrid search systems use, in pure Go, on top of SQLite. The whole pipeline runs in a single process — no server, no IPC.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  query: "rate limiter exhaustion"                                   │
-└────────────────────┬────────────────────────────────────────────────┘
-                     │
-        ┌────────────┴────────────┐
-        │                         │   (parallel goroutines)
-        ▼                         ▼
-┌───────────────┐         ┌───────────────────┐
-│  FTS5 BM25    │         │  vec0 KNN         │
-│  ranked hits  │         │  cosine distance  │
-└───────┬───────┘         └─────────┬─────────┘
-        │                           │
-        └────────────┬──────────────┘
-                     ▼
-        ┌─────────────────────────────┐
-        │  RRF fusion (k=60)          │
-        │  + top-rank bonus           │
-        │  + adaptive min-score floor │
-        └────────────┬────────────────┘
-                     ▼
-        ┌─────────────────────────────┐
-        │  results, ranked            │
-        │  with `--explain` trace     │
-        └─────────────────────────────┘
+```mermaid
+flowchart TD
+    Q["<b>query</b><br><i>rate limiter exhaustion</i>"]
+    Q --> BM25
+    Q --> VEC
+    subgraph parallel ["parallel goroutines"]
+        direction LR
+        BM25["<b>FTS5 BM25</b><br>ranked hits"]
+        VEC["<b>vec0 KNN</b><br>cosine distance"]
+    end
+    BM25 --> RRF
+    VEC --> RRF
+    RRF["<b>RRF fusion (k=60)</b><br>+ top-rank bonus<br>+ adaptive min-score floor"]
+    RRF --> R["<b>results, ranked</b><br>with <code>--explain</code> trace"]
+
+    classDef step fill:#fef2f2,stroke:#dc2626,stroke-width:2px,color:#1f2937
+    classDef result fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#1f2937
+    classDef query fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1f2937
+    class Q query
+    class BM25,VEC,RRF step
+    class R result
 ```
 
 ### BM25
@@ -174,6 +181,14 @@ When you edit a file and re-run `recall index`, only the chunks whose `content_h
 | `recall version` | Print version, build date, commit, Go version |
 
 Shared search flags: `-n`, `-c/--collection` (comma-separated for multi-collection), `--all`, `--min-score`, `--full`, `--line-numbers`, `--explain`. Output formats: `--json`, `--csv`, `--md`, `--xml`, `--files`.
+
+### Multi-collection cross-search
+
+Index two repos as separate collections, then search either one, the other, or both at once with `-c repo1,repo2`:
+
+<p align="center">
+  <img src="assets/multi-collection.gif" alt="multi-collection: notes alone, src alone, then both with -c notes,src" width="900">
+</p>
 
 ## Architecture
 

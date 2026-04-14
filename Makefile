@@ -17,10 +17,19 @@ LDFLAGS := -X github.com/ugurcan-aytar/recall/internal/commands.Version=$(VERSIO
            -X github.com/ugurcan-aytar/recall/internal/commands.Commit=$(COMMIT) \
            -X github.com/ugurcan-aytar/recall/internal/commands.BuildDate=$(BUILDDATE)
 
-.PHONY: build test test-race vet fmt install clean
+.PHONY: build test test-race vet fmt install clean demos
 
 build:
 	go build -tags $(TAGS) -ldflags "$(LDFLAGS)" -o recall ./cmd/recall
+
+# Render the README demo GIFs into assets/ via charmbracelet/vhs.
+# Requires `brew install vhs`. Each .tape script in demos/ writes its own
+# assets/<name>.gif so re-rendering one doesn't touch the others.
+demos:
+	@command -v vhs >/dev/null || { echo "vhs not installed: brew install vhs"; exit 1; }
+	go build -tags $(TAGS) -ldflags "$(LDFLAGS)" -o demos/recall ./cmd/recall
+	@for tape in demos/*.tape; do echo ">> $$tape"; vhs "$$tape"; done
+	@rm -f demos/recall
 
 test:
 	go test -tags $(TAGS) ./...
