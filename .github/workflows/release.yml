@@ -138,11 +138,11 @@ jobs:
 
       - name: Push Homebrew formula
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "HOMEBREW_TAP_TOKEN secret not set — skipping brew tap push."
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_GITHUB_TOKEN secret not set — skipping brew tap push."
             exit 0
           fi
           TAG="${{ steps.ver.outputs.tag }}"
@@ -199,7 +199,7 @@ jobs:
           end
           EOF
 
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/ugurcan-aytar/homebrew-recall.git" /tmp/tap
+          git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/ugurcan-aytar/homebrew-recall.git" /tmp/tap
           mkdir -p /tmp/tap/Formula
           cp /tmp/recall.rb /tmp/tap/Formula/recall.rb
           cd /tmp/tap
