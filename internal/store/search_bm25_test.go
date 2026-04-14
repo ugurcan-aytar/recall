@@ -205,6 +205,70 @@ func TestSearchBM25EmptyQuery(t *testing.T) {
 	}
 }
 
+// TestSearchBM25PhraseMatchesOnlyExactPhrase verifies that a quoted
+// phrase translates to FTS5's phrase operator and rejects docs that
+// have the words individually but not adjacent.
+func TestSearchBM25PhraseMatchesOnlyExactPhrase(t *testing.T) {
+	s := seedSearchCorpus(t)
+
+	out, err := s.SearchBM25(SearchOptions{Query: `"authentication flow"`, Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchBM25: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal(`"authentication flow" returned no hits`)
+	}
+	for _, r := range out {
+		if r.Path != "auth.md" {
+			t.Errorf(`phrase match leaked into %s (only auth.md has "authentication flow")`, r.Path)
+		}
+	}
+}
+
+// TestSearchBM25NegationExcludesMatchingDoc verifies that user-level
+// -term translates to FTS5 NOT and drops docs that contain the
+// negated term.
+func TestSearchBM25NegationExcludesMatchingDoc(t *testing.T) {
+	s := seedSearchCorpus(t)
+
+	// Sanity: without the negation, "authentication" matches auth.md
+	// (JWT / flow) and api.md (cross-collection).
+	baseline, err := s.SearchBM25(SearchOptions{Query: "authentication", Limit: 10})
+	if err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	var baseHits []string
+	for _, r := range baseline {
+		baseHits = append(baseHits, r.Path)
+	}
+	if len(baseHits) < 1 {
+		t.Fatalf("baseline should return auth.md at minimum: %+v", baseHits)
+	}
+
+	// With -JWT, auth.md's "authentication flow handles JWT tokens"
+	// must be excluded. api.md doesn't mention JWT so it survives.
+	out, err := s.SearchBM25(SearchOptions{Query: "authentication -JWT", Limit: 10})
+	if err != nil {
+		t.Fatalf("negation query: %v", err)
+	}
+	for _, r := range out {
+		if r.Path == "auth.md" {
+			t.Error("auth.md should have been excluded by -JWT")
+		}
+	}
+}
+
+// TestSearchBM25AllNegationReturnsEmptyQuery verifies that a query
+// with no positive terms (only -foo -bar) yields an "empty search
+// query" error rather than a cryptic FTS5 failure.
+func TestSearchBM25AllNegationReturnsEmptyQuery(t *testing.T) {
+	s := seedSearchCorpus(t)
+	_, err := s.SearchBM25(SearchOptions{Query: "-redis -memcached", Limit: 10})
+	if err == nil {
+		t.Error("expected error when query is all-negations, got nil")
+	}
+}
+
 // Natural-language questions often contain characters ("?", ":", "*")
 // that FTS5 treats as operators. Raw passthrough produces cryptic
 // "fts5: syntax error" failures. SearchBM25 must sanitise the query
@@ -237,8 +301,9 @@ func TestSanitizeFTSQuery(t *testing.T) {
 	cases := []struct {
 		name, in, want string
 	}{
+		// Baseline barewords.
 		{"single token passes through", "auth", "auth"},
-		{"short query keeps stopwords", "is rate", "is rate"}, // 2 tokens, filter skipped
+		{"short query keeps stopwords", "is rate", "is rate"},
 		{"short query — 3 tokens kept intact", "the rate limit", "the rate limit"},
 		{"long query drops stopwords", "What did the team decide about authentication?", "team decide authentication"},
 		{"natural-language chat question", "what's the circuit breaker recovery pattern", "circuit breaker recovery pattern"},
@@ -251,7 +316,32 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		{"hyphen becomes space", "rate-limit breaker pattern docs", "rate limit breaker pattern docs"},
 		{"unicode letters preserved", "naïve café approach", "naïve café approach"},
 		{"turkish question drops fillers", "neden rate limiter için bir circuit breaker gerekli", "neden rate limiter circuit breaker gerekli"},
-		{"all-stopword query falls back to unfiltered", "what is the a or", "what is the a or"}, // every token is a stopword → filter empties → fall back to unfiltered
+
+		// Quoted phrases.
+		{"single quoted phrase", `"circuit breaker"`, `"circuit breaker"`},
+		{"phrase plus bareword", `"circuit breaker" timeout`, `"circuit breaker" timeout`},
+		{"phrase preserves stopwords inside quotes", `"machine learning is fun"`, `"machine learning is fun"`},
+		{"unclosed phrase runs to EOL", `"rate limiter`, `"rate limiter"`},
+		{"empty quotes drop silently", `"" auth`, `auth`},
+		{"phrase strips embedded punctuation", `"rate-limiter*:"`, `"rate limiter"`},
+
+		// Negation.
+		{"single negation", `auth -redis`, `auth NOT redis`},
+		{"negation of phrase", `"rate limiter" -"in memory"`, `"rate limiter" NOT "in memory"`},
+		{"multiple negations", `auth -redis -memcached`, `auth NOT redis NOT memcached`},
+		{"negation on long query", `rate limiter algorithm -redis -memcached`, `rate limiter algorithm NOT redis NOT memcached`},
+		{"stray dashes ignored", `auth - - rate`, `auth rate`},
+		{"double-dash strips to bareword", `auth --rate`, `auth rate`},
+		{"all-negation empties", `-redis -memcached`, ``},
+		{"qmd example: phrases + negation", `"rate limiter" algorithm -redis -memcached`, `"rate limiter" algorithm NOT redis NOT memcached`},
+
+		// Stopword filter interaction with phrases / negation.
+		{"phrase bypasses stopword filter on long query",
+			`"the circuit breaker" is broken in production environments`,
+			`"the circuit breaker" broken production environments`},
+		{"negation bypasses stopword filter",
+			`what is the circuit breaker -redis`,
+			`circuit breaker NOT redis`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

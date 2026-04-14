@@ -68,7 +68,12 @@ recall index
 # 3. Full-text search (works immediately, no model needed)
 recall search "rate limiter"
 
-# 4. (Optional) hybrid BM25 + vector — needs an embedding backend
+# 4. Search syntax: quoted phrases and exclusion
+recall search '"circuit breaker" timeout -redis'
+#      └── matches docs with the exact phrase "circuit breaker"
+#          and the word "timeout", excluding anything that mentions redis.
+
+# 5. (Optional) hybrid BM25 + vector — needs an embedding backend
 export RECALL_EMBED_PROVIDER=openai
 export OPENAI_API_KEY=sk-…
 recall embed

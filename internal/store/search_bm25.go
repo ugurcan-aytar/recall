@@ -8,35 +8,187 @@ import (
 )
 
 // sanitizeFTSQuery rewrites a user-typed query into an FTS5-safe
-// MATCH expression. Raw user input has two classes of problem:
+// MATCH expression. The sanitiser has three jobs:
 //
-//  1. Punctuation FTS5 reads as operators ("?", ":", "*", apostrophes,
-//     parens, uppercase AND / OR / NOT / NEAR) — passing through
-//     verbatim produces cryptic "fts5: syntax error" failures.
-//  2. Natural-language noise ("what is", "how can I", "the", "a")
-//     that FTS5's implicit-AND then demands every doc must contain.
-//     A chat-style question like "what's the circuit breaker pattern"
-//     fans out to seven required terms — no single chunk contains all
-//     seven, so retrieval returns zero hits even though the corpus
-//     has an obvious match.
+//  1. Translate qmd-style user syntax into FTS5 syntax:
 //
-// The sanitiser handles (1) by replacing every non-word rune with a
-// space (FTS5 reads space-separated barewords as implicit AND) and
-// lowercasing surviving AND/OR/NOT/NEAR. It handles (2) by dropping
-// common stopwords in English + Turkish (the two languages recall
-// actively supports) once the query has more than three tokens —
-// short queries are treated as precise keyword searches and pass
-// through untouched.
+//       "exact phrase"         → FTS5 "phrase"    (quotes preserved)
+//       -term                  → FTS5 NOT term    (positive … NOT term)
+//       -"exact phrase"        → FTS5 NOT "phrase"
+//       word1 word2            → FTS5 word1 word2 (implicit AND)
 //
-// If stopword filtering would leave the query empty (e.g. the user
-// literally typed "the"), we fall back to the unfiltered token list
-// so BM25 still runs rather than returning an "empty query" error.
-// Unicode letters / digits pass through unchanged so non-ASCII
-// corpora keep working.
+//  2. Strip punctuation FTS5 reads as operators ("?", ":", "*",
+//     apostrophes, parens, stray dashes) from barewords — without
+//     this, natural-language input produces cryptic "fts5: syntax
+//     error" failures.
+//
+//  3. Drop common English + Turkish stopwords from un-quoted,
+//     un-negated barewords once the query has more than three
+//     effective terms. Quoted phrases and negated tokens are
+//     preserved verbatim — when a user explicitly quotes or excludes
+//     something, they meant it.
+//
+// If filtering would leave no positive terms (e.g. the user typed
+// only "the" or only a bare "-redis"), the sanitiser returns an
+// empty string so the caller can produce an "empty search query"
+// error rather than handing FTS5 something meaningless.
 func sanitizeFTSQuery(q string) string {
+	tokens := parseQueryTokens(q)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	// Apply stopword filtering only to un-negated, un-quoted barewords
+	// once we have more than three effective terms. Phrases and
+	// negations bypass the filter — the user asked for them
+	// explicitly.
+	bareCount := 0
+	for _, t := range tokens {
+		if !t.phrase && !t.negated {
+			bareCount++
+		}
+	}
+	filterStopwords := bareCount > 3
+
+	var positives, negatives []queryToken
+	for _, t := range tokens {
+		if filterStopwords && !t.phrase && !t.negated {
+			if _, isStop := ftsStopwords[strings.ToLower(t.text)]; isStop {
+				continue
+			}
+		}
+		if t.negated {
+			negatives = append(negatives, t)
+		} else {
+			positives = append(positives, t)
+		}
+	}
+
+	// FTS5's NOT is binary: "A NOT B". An all-negations query
+	// ("-redis") or a query where stopword filtering stripped every
+	// positive term leaves nothing for NOT to bind to. Return empty
+	// so SearchBM25 raises "empty search query".
+	if len(positives) == 0 {
+		return ""
+	}
+
 	var b strings.Builder
-	b.Grow(len(q))
-	for _, r := range q {
+	for i, t := range positives {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(t.ftsForm())
+	}
+	for _, t := range negatives {
+		b.WriteString(" NOT ")
+		b.WriteString(t.ftsForm())
+	}
+	return b.String()
+}
+
+// queryToken is one unit out of parseQueryTokens. text holds the
+// cleaned content (no quotes, no leading '-'). phrase means the user
+// wrapped it in double quotes. negated means the user prefixed it
+// with '-'.
+type queryToken struct {
+	text    string
+	phrase  bool
+	negated bool
+}
+
+// ftsForm renders a token into its FTS5 literal — phrases keep their
+// quotes and lowercase any operator keywords inside, barewords drop
+// through strings.Fields cleanup.
+func (t queryToken) ftsForm() string {
+	if t.phrase {
+		return `"` + t.text + `"`
+	}
+	return t.text
+}
+
+// parseQueryTokens walks the raw query and splits it into
+// queryTokens. It honours simple shell-style quoting ("…") and a
+// single leading '-' on each un-quoted word or on a quoted phrase
+// (-"…"). Mid-word dashes ("rate-limit") are NOT treated as
+// negation — they just split into two barewords, matching what
+// FTS5 would see anyway.
+func parseQueryTokens(q string) []queryToken {
+	var out []queryToken
+	i := 0
+	for i < len(q) {
+		// Skip leading whitespace.
+		for i < len(q) && isSpace(q[i]) {
+			i++
+		}
+		if i >= len(q) {
+			break
+		}
+
+		negated := false
+		// Leading '-' becomes a negation prefix. Require a non-space
+		// non-dash to follow (so stray "-" or "--" in the input don't
+		// create empty tokens).
+		if q[i] == '-' && i+1 < len(q) && !isSpace(q[i+1]) && q[i+1] != '-' {
+			negated = true
+			i++
+		}
+
+		if i < len(q) && q[i] == '"' {
+			// Consume a quoted phrase. Missing close-quote = phrase
+			// runs to end of input.
+			i++
+			start := i
+			for i < len(q) && q[i] != '"' {
+				i++
+			}
+			phraseText := sanitizePhraseBody(q[start:i])
+			if i < len(q) {
+				i++ // consume closing '"'
+			}
+			if phraseText != "" {
+				out = append(out, queryToken{text: phraseText, phrase: true, negated: negated})
+			}
+			continue
+		}
+
+		// Unquoted bareword — consume until whitespace or a quote.
+		start := i
+		for i < len(q) && !isSpace(q[i]) && q[i] != '"' {
+			i++
+		}
+		raw := q[start:i]
+		cleaned := sanitizeBareword(raw)
+		if cleaned == "" {
+			continue
+		}
+		// If the token splits on internal punctuation (e.g.
+		// "rate-limit" → "rate limit"), emit each piece as its own
+		// token carrying the same negation flag. This matches what
+		// FTS5 would do with a raw bareword anyway.
+		for _, piece := range strings.Fields(cleaned) {
+			lower := strings.ToLower(piece)
+			switch lower {
+			case "and", "or", "not", "near":
+				// Operator keywords — lowercase so FTS5 sees them as
+				// literal terms, not control syntax. (Users never
+				// intend FTS5 AND/OR semantics; recall's contract is
+				// implicit-AND with phrase + negation extensions.)
+				piece = lower
+			}
+			out = append(out, queryToken{text: piece, negated: negated})
+		}
+	}
+	return out
+}
+
+// sanitizeBareword strips characters FTS5 would treat as operators
+// ("?", ":", "*", parens, apostrophes, etc.) from a bareword. Unicode
+// letters, digits, and underscores survive. Internal dashes become
+// spaces so "rate-limit" → "rate limit".
+func sanitizeBareword(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_':
 			b.WriteRune(r)
@@ -44,31 +196,31 @@ func sanitizeFTSQuery(q string) string {
 			b.WriteByte(' ')
 		}
 	}
-	fields := strings.Fields(b.String())
-	for i, f := range fields {
-		switch strings.ToUpper(f) {
-		case "AND", "OR", "NOT", "NEAR":
-			fields[i] = strings.ToLower(f)
+	return b.String()
+}
+
+// sanitizePhraseBody cleans the content of a quoted phrase. FTS5's
+// phrase syntax is strict: the only meaningful characters inside
+// quotes are tokenised by the unicode61 tokenizer, and embedded
+// double quotes need doubling ("" for a literal quote). We
+// conservatively strip anything that isn't a word character, then
+// collapse whitespace.
+func sanitizePhraseBody(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_', r == ' ':
+			b.WriteRune(r)
+		default:
+			b.WriteByte(' ')
 		}
 	}
-	// Only filter stopwords on longer queries. "rate limit" and
-	// "auth flow" are precise 2-token searches; we don't want the
-	// sanitiser second-guessing those. Natural-language questions
-	// start to benefit at around 4+ tokens.
-	if len(fields) <= 3 {
-		return strings.Join(fields, " ")
-	}
-	filtered := fields[:0:len(fields)]
-	for _, f := range fields {
-		if _, isStop := ftsStopwords[strings.ToLower(f)]; isStop {
-			continue
-		}
-		filtered = append(filtered, f)
-	}
-	if len(filtered) == 0 {
-		return strings.Join(fields, " ")
-	}
-	return strings.Join(filtered, " ")
+	return strings.TrimSpace(strings.Join(strings.Fields(b.String()), " "))
+}
+
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // ftsStopwords is the union of English + Turkish fillers we drop from

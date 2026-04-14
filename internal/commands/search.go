@@ -36,7 +36,25 @@ var searchOpts searchFlags
 var searchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "BM25 full-text search (no LLM)",
-	Args:  cobra.MinimumNArgs(1),
+	Long: `BM25 full-text search (no LLM).
+
+Query syntax:
+    recall search rate limiter
+        implicit-AND across all words; every token must appear in the doc.
+
+    recall search '"rate limiter"'
+        exact phrase match; the two words must appear adjacent.
+
+    recall search 'authentication -JWT'
+        exclude docs mentioning JWT (negation via leading '-').
+
+    recall search '"machine learning" algorithm -redis -memcached'
+        phrases + words + multiple negations combine freely.
+
+Wrap the whole query in single quotes when it contains shell-meaningful
+characters ("..." / * / ? / &), so your shell doesn't eat them before
+recall sees them.`,
+	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		q := strings.Join(args, " ")
 
