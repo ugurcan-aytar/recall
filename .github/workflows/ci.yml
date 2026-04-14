@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod tidiness
+        run: |
+          go mod download
+          go mod verify
+
+      - name: go vet
+        run: go vet -tags sqlite_fts5 ./...
+
+      - name: go build
+        run: go build -tags sqlite_fts5 ./...
+
+      - name: go test
+        run: go test -tags sqlite_fts5 -race ./...

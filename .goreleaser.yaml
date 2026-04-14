@@ -1,0 +1,99 @@
+# goreleaser config for recall.
+#
+# CGo cross-compilation note: a single host can't cross-compile CGo
+# binaries to a different OS. The release workflow
+# (.github/workflows/release.yml) runs goreleaser on per-platform runners
+# (ubuntu-latest builds linux, macos-latest builds darwin) and then a
+# final job assembles the GitHub release. Locally `goreleaser release
+# --snapshot --clean` only builds the host OS.
+version: 2
+
+project_name: recall
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: recall
+    main: ./cmd/recall
+    binary: recall
+    env:
+      - CGO_ENABLED=1
+    tags:
+      - sqlite_fts5
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/ugurcan-aytar/recall/internal/commands.Version={{.Version}}
+      - -X github.com/ugurcan-aytar/recall/internal/commands.Commit={{.ShortCommit}}
+      - -X github.com/ugurcan-aytar/recall/internal/commands.BuildDate={{.Date}}
+
+archives:
+  - id: recall
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ .Tag }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: true
+  prerelease: auto
+
+# Homebrew tap publication. Requires:
+#   1. The repo `ugurcan-aytar/homebrew-recall` to exist (empty is fine).
+#   2. A GitHub token (HOMEBREW_TAP_TOKEN) in the release workflow with
+#      write access to the tap repo.
+# After the first successful release, users can install via:
+#   brew install ugurcan-aytar/recall/recall
+brews:
+  - name: recall
+    repository:
+      owner: ugurcan-aytar
+      name: homebrew-recall
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/ugurcan-aytar/recall
+    description: "Local search engine for your notes and documents (BM25 + vector + hybrid fusion)"
+    license: MIT
+    test: |
+      system "#{bin}/recall", "version"
+    install: |
+      bin.install "recall"
+    # Local GGUF embedding requires libbinding.a, which the bottle doesn't
+    # ship. Document the optional rebuild step in the caveats so brew
+    # users see it after install.
+    caveats: |
+      recall is installed without the local GGUF embedding backend (~146 MB
+      model). To enable vector / hybrid search, either:
+        * rebuild from source with -tags 'sqlite_fts5 embed_llama'
+          (requires libbinding.a — see github.com/ugurcan-aytar/recall),
+        * or set RECALL_EMBED_PROVIDER=openai|voyage and an API key.
+
+      BM25 full-text search via `recall search` works out of the box.

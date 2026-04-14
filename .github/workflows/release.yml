@@ -1,0 +1,88 @@
+name: Release
+
+# Triggered when a maintainer pushes a `v*.*.*` tag.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # to create the GitHub release
+  packages: write   # in case we ever publish container images
+
+jobs:
+  # Build the per-platform binaries on native runners (CGo can't
+  # cross-compile between OSes), upload them as artefacts, then let a
+  # final job assemble the GitHub release + Homebrew tap PR.
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # goreleaser needs full history for changelog
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: goreleaser (snapshot, host OS only)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --snapshot --clean --skip=publish --skip=homebrew --skip=announce
+
+      - name: Upload dist artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+
+  publish:
+    name: publish release + brew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Pull per-platform artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Flatten dist/
+        run: |
+          mkdir -p dist-merged
+          # goreleaser snapshot produces dist/recall_..._linux_amd64/recall etc.
+          # Move them to a single directory the publish step understands.
+          find dist/ -type f \( -name "recall" -o -name "recall.exe" -o -name "*.tar.gz" -o -name "checksums.txt" \) -exec cp -v {} dist-merged/ \;
+          ls -la dist-merged/
+
+      - name: goreleaser publish
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Personal access token with `repo` scope on
+          # ugurcan-aytar/homebrew-recall. Set in repo Settings → Secrets.
+          # If unset, the brews: stanza in .goreleaser.yaml will fail —
+          # use --skip=homebrew on first release if you haven't set it up.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

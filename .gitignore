@@ -1,0 +1,57 @@
+# Binaries — anchor to repo root so cmd/recall/ and pkg/recall/ aren't ignored.
+/recall
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build
+dist/
+build/
+bin/
+
+# Dependencies
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test & coverage
+coverage.out
+*.test
+*.out
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Models (large GGUF files)
+models/
+*.gguf
+
+# C build artifacts (go-llama.cpp)
+libbinding.a
+*.o
+*.a
+
+# Local env
+.env
+.env.local
+
+# Local-only dev notes — never committed.
+# CLAUDE.md and ROADMAP.md are private working docs between the maintainer
+# and Claude Code; .claude/ holds personal Claude Code state. None of
+# these ship with the repo.
+qmd_notes.txt
+CLAUDE.md
+ROADMAP.md
+.claude/
