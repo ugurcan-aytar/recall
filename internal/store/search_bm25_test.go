@@ -204,3 +204,54 @@ func TestSearchBM25EmptyQuery(t *testing.T) {
 		t.Error("expected error on empty query")
 	}
 }
+
+// Natural-language questions often contain characters ("?", ":", "*")
+// that FTS5 treats as operators. Raw passthrough produces cryptic
+// "fts5: syntax error" failures. SearchBM25 must sanitise the query
+// first. Regression guard for the v0.1.2 fix.
+func TestSearchBM25SanitizesUserQuestions(t *testing.T) {
+	s := seedSearchCorpus(t)
+
+	cases := []string{
+		"What did the team decide about authentication?",
+		"auth*",
+		"what is the rate-limit:",
+		"(broken paren",
+		"AND",
+		"auth OR rate",
+		"auth? NOT rate.",
+	}
+	for _, q := range cases {
+		q := q
+		t.Run(q, func(t *testing.T) {
+			out, err := s.SearchBM25(SearchOptions{Query: q, Limit: 5})
+			if err != nil {
+				t.Fatalf("SearchBM25(%q) errored: %v", q, err)
+			}
+			_ = out // presence / absence of hits is corpus-dependent; we're just guarding against syntax errors.
+		})
+	}
+}
+
+func TestSanitizeFTSQuery(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"auth", "auth"},
+		{"What did the team decide about authentication?", "What did the team decide about authentication"},
+		{"auth*", "auth"},
+		{"auth OR rate", "auth or rate"},
+		{"AND", "and"},
+		{"NEAR foo", "near foo"},
+		{"  \t\n  ", ""},
+		{"hello world!", "hello world"},
+		{"rate-limit", "rate limit"},
+		{"naïve café", "naïve café"}, // unicode letters preserved
+	}
+	for _, tc := range cases {
+		got := sanitizeFTSQuery(tc.in)
+		if got != tc.want {
+			t.Errorf("sanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

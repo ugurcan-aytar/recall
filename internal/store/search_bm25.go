@@ -4,7 +4,41 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"unicode"
 )
+
+// sanitizeFTSQuery rewrites a user-typed query into an FTS5-safe MATCH
+// expression. Raw user input often contains punctuation that FTS5
+// treats as query operators — "?", ":", "*", apostrophes, parens, the
+// uppercase AND / OR / NOT / NEAR keywords — and passing any of those
+// through verbatim produces cryptic "fts5: syntax error" failures
+// instead of retrieval results.
+//
+// The sanitiser replaces every non-word rune with a space (FTS5 reads
+// space-separated barewords as an implicit-AND term list), then
+// lowercases any surviving AND/OR/NOT/NEAR token so FTS5 treats them
+// as literal terms rather than operators. Unicode letters and digits
+// pass through unchanged so non-ASCII corpora keep working.
+func sanitizeFTSQuery(q string) string {
+	var b strings.Builder
+	b.Grow(len(q))
+	for _, r := range q {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	fields := strings.Fields(b.String())
+	for i, f := range fields {
+		switch strings.ToUpper(f) {
+		case "AND", "OR", "NOT", "NEAR":
+			fields[i] = strings.ToLower(f)
+		}
+	}
+	return strings.Join(fields, " ")
+}
 
 // splitCollections normalises an [SearchOptions.Collection] value into a
 // slice. Empty input returns nil ("no filter"); single value returns one
@@ -90,7 +124,7 @@ LIMIT ?`
 // SearchBM25 runs an FTS5 MATCH query ranked by the SQLite bm25() function.
 // The hot path uses prepared statements cached on the Store.
 func (s *Store) SearchBM25(opts SearchOptions) ([]SearchResult, error) {
-	q := strings.TrimSpace(opts.Query)
+	q := sanitizeFTSQuery(opts.Query)
 	if q == "" {
 		return nil, fmt.Errorf("empty search query")
 	}
