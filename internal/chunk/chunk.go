@@ -38,14 +38,19 @@ func (c Chunk) ContentHash() string {
 // Tuning knobs.
 //
 // DefaultTargetTokens history: 900 (qmd R2) → 384 (R3+, gollama's
-// effective 512 n_ubatch cap) → 768 (v0.2.3+, llama-server subprocess
-// honours -ub = 4096 so the cap that forced 384 is gone). Nomic-embed's
-// training context is 2048; with the words×1.3 estimator under-counting
-// BERT WordPieces by ~2× worst case (see CLAUDE.md "Tuned parameters"),
-// 768 estimated tokens lands comfortably under 2048 actual tokens while
-// giving every chunk more surrounding context to embed against.
+// effective 512 n_ubatch cap) → 768 (v0.2.3, after llama-server
+// subprocess removed the 512 cap) → 900 (v0.2.7, matches qmd's
+// original target). A/B on a 3968-doc / 116k-chunk corpus at 900
+// vs 768: chunk count dropped 13.6% (57,928 → 50,036), zero
+// truncation events against nomic's 2048-token ceiling (the
+// maxInputChars=4000 guard bounds us well below it), and
+// retrieval-quality parity-or-slight-win across five semantic
+// queries (pricing surfaces Madhavan Ramanujam, retention
+// surfaces RetentionAndEngagementBonus; the rest shuffle within
+// the same score cluster). Smaller index, faster embed, no
+// regression — 900 shipped on that evidence.
 const (
-	DefaultTargetTokens = 768
+	DefaultTargetTokens = 900
 	DefaultOverlapPct   = 0.15
 	windowTokens        = 200
 	tokensPerWord       = 1.3
