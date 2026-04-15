@@ -1,44 +1,55 @@
-//go:build embed_llama
-
-// Local GGUF embedding backend wrapping godeps/gollama. Compiled in only
-// when the `embed_llama` build tag is set, because it requires
-// libbinding.a (see CLAUDE.md "Build" section).
+// Local GGUF embedding backend on top of dianlight/gollama.cpp.
 //
-// The default build uses local_stub.go which returns a clear "not compiled
-// in" error. All tests in this project use MockEmbedder; this file is never
-// exercised by go test.
+// dianlight/gollama.cpp is a purego (no-CGo) wrapper around llama.cpp.
+// The package downloads the platform-appropriate llama.cpp shared
+// library on first use into ~/.cache/gollama/libs/ (override with
+// $GOLLAMA_CACHE_DIR). After that recall talks to the runtime via
+// purego + libffi — no static archive, no rpath flags, no libbinding.a
+// build step. Compiles unconditionally (no `embed_llama` build tag);
+// the binary always ships with local-embedding capability.
+//
+// Lifecycle: gollama.Backend_init / Backend_free are process-global
+// (the underlying llama.cpp API state is too). We call Backend_init
+// lazily on the first NewLocalEmbedder, never call Backend_free —
+// recall's CLI is one-shot, the OS reclaims everything on exit.
 
 package embed
 
 import (
 	"errors"
 	"fmt"
+	"math"
+	"runtime"
 	"sync"
+	"unsafe"
 
-	llama "github.com/godeps/gollama"
+	gollama "github.com/dianlight/gollama.cpp"
+
+	"github.com/ugurcan-aytar/recall/internal/llamacpp"
 )
 
 // LocalEmbedderOptions configures the GGUF backend.
 type LocalEmbedderOptions struct {
 	ModelPath string // absolute path to the .gguf file
-	Threads   int    // 0 ⇒ gollama default
+	Threads   int    // 0 ⇒ runtime.NumCPU()
 	Context   int    // 0 ⇒ 2048
-	Workers   int    // worker pool size; 0/1 ⇒ single shared model + mutex (current default)
+	Workers   int    // worker pool size; 0/1 ⇒ single context (current default)
 }
 
-// MaxLocalWorkers caps the number of GGUF model instances we'll load
-// in parallel. Each instance mmaps the full ~146 MB nomic file plus
-// its own context (KV cache); a hard upper bound prevents a typo'd
-// RECALL_EMBED_WORKERS=64 from OOM-ing the user's laptop.
+// MaxLocalWorkers caps how many independent llama.cpp contexts we
+// hold open per Embedder. Each context owns its own KV cache; total
+// RAM scales linearly. The model weights are mmap'd ONCE and shared
+// across all contexts (a big win vs the godeps/gollama pattern,
+// which loaded N model copies).
 const MaxLocalWorkers = 8
 
-// localEmbedder owns one or more llama.Model + Context pairs and
-// dispatches Embed() across them via a buffered semaphore. With
-// Workers <= 1 it degenerates to a single model + sync.Mutex —
-// identical to the pre-parallel implementation, no extra RAM.
+// localEmbedder owns one llama.cpp Model + N Context handles. The
+// pool channel doubles as a semaphore: workers grab a context, run
+// inference, return it.
 type localEmbedder struct {
-	pool      chan *workerCtx // semaphore + worker handle queue
-	all       []*workerCtx    // every owned context, for Close()
+	model     gollama.LlamaModel
+	pool      chan gollama.LlamaContext
+	all       []gollama.LlamaContext
 	modelName string
 	family    PromptFamily
 	dims      int
@@ -47,23 +58,21 @@ type localEmbedder struct {
 	closed bool
 }
 
-// workerCtx pairs a Model with its Context. Each worker owns one
-// pair so concurrent EmbedSingle calls don't trip gollama's
-// single-context invariants.
-type workerCtx struct {
-	model *llama.Model
-	ctx   *llama.Context
-}
+// Backend init lives in internal/llamacpp so embed and llm share a
+// single sync.Once across the process. The first NewLocalEmbedder
+// or NewLocalGenerator call pays the (~100 MB) shared-library
+// download cost; subsequent calls return immediately.
 
-// NewLocalEmbedder loads opts.ModelPath. With Workers <= 1 it loads
-// a single model + context (the v0.1 default — minimum RAM, single-
-// threaded inference). With Workers > 1 it loads N independent
-// model+context pairs so Embed() can dispatch chunks concurrently
-// across them. Each extra worker costs ~146 MB (nomic Q8) + the
-// context's KV cache.
+// NewLocalEmbedder loads opts.ModelPath. The model weights mmap once
+// and are shared across the worker contexts; Workers controls how
+// many independent inference contexts we open. With Workers <= 1
+// behaviour matches the v0.1 single-context default.
 func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 	if opts.ModelPath == "" {
 		return nil, errors.New("local embedder: model path is required")
+	}
+	if err := llamacpp.EnsureBackend(); err != nil {
+		return nil, err
 	}
 
 	workers := opts.Workers
@@ -74,69 +83,63 @@ func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 		workers = MaxLocalWorkers
 	}
 
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = runtime.NumCPU()
+	}
+
 	ctxSize := opts.Context
 	if ctxSize <= 0 {
 		ctxSize = 2048
 	}
-	buildContextOpts := func() []llama.ContextOption {
-		o := []llama.ContextOption{
-			llama.WithEmbeddings(),
-			llama.WithContext(ctxSize),
-			// Force one sequence per context. gollama otherwise defaults
-			// to n_seq_max=8, splitting n_ctx (2048) across 8 sequences =
-			// 256 tokens per chunk — SIGTRAPs on any chunk over ~250
-			// tokens.
-			llama.WithParallel(1),
-			// Match batch to context so a single chunk fits one
-			// llama_batch.
-			llama.WithBatch(ctxSize),
-		}
-		if opts.Threads > 0 {
-			o = append(o, llama.WithThreads(opts.Threads))
-		}
-		return o
+
+	modelParams := gollama.Model_default_params()
+	model, err := gollama.Model_load_from_file(opts.ModelPath, modelParams)
+	if err != nil {
+		return nil, fmt.Errorf("load gguf model %s: %w", opts.ModelPath, err)
 	}
 
-	pool := make(chan *workerCtx, workers)
-	all := make([]*workerCtx, 0, workers)
-	var dims int
+	pool := make(chan gollama.LlamaContext, workers)
+	all := make([]gollama.LlamaContext, 0, workers)
+	dims := int(gollama.Model_n_embd(model))
+	if dims <= 0 {
+		gollama.Model_free(model)
+		return nil, fmt.Errorf("model %s reports %d embedding dimensions", opts.ModelPath, dims)
+	}
+
 	for i := 0; i < workers; i++ {
-		model, err := llama.LoadModel(opts.ModelPath)
+		ctxParams := gollama.Context_default_params()
+		ctxParams.NCtx = uint32(ctxSize)
+		// NBatch and NUbatch must match — gollama's old wrapper
+		// silently kept NUbatch at the 512 default while NBatch
+		// climbed, blowing up on chunks > ~256 tokens. dianlight
+		// exposes both fields directly so we set them in lockstep.
+		ctxParams.NBatch = uint32(ctxSize)
+		ctxParams.NUbatch = uint32(ctxSize)
+		// One sequence per context. llama.cpp's old auto-bump of
+		// n_parallel to 8 when embeddings were on (which divided
+		// n_ctx across 8 sequences and SIGTRAP'd long chunks)
+		// doesn't exist in dianlight — but we still pin to 1
+		// explicitly so future llama.cpp default changes don't
+		// surprise us.
+		ctxParams.NSeqMax = 1
+		ctxParams.NThreads = int32(threads)
+		ctxParams.NThreadsBatch = int32(threads)
+		ctxParams.Embeddings = 1
+
+		ctx, err := gollama.Init_from_model(model, ctxParams)
 		if err != nil {
-			closeWorkers(all)
-			return nil, fmt.Errorf("load gguf model %s (worker %d): %w", opts.ModelPath, i, err)
-		}
-		ctx, err := model.NewContext(buildContextOpts()...)
-		if err != nil {
-			_ = model.Close()
-			closeWorkers(all)
+			closeContexts(all)
+			gollama.Model_free(model)
 			return nil, fmt.Errorf("new context (worker %d): %w", i, err)
 		}
-		// Probe the first worker's dim. Subsequent workers must produce
-		// the same width; the model is identical so this is more of a
-		// belt-and-braces invariant than a real check.
-		probe, err := ctx.GetEmbeddings("hello")
-		if err != nil {
-			_ = ctx.Close()
-			_ = model.Close()
-			closeWorkers(all)
-			return nil, fmt.Errorf("probe embedding (worker %d): %w", i, err)
-		}
-		if i == 0 {
-			dims = len(probe)
-		} else if len(probe) != dims {
-			_ = ctx.Close()
-			_ = model.Close()
-			closeWorkers(all)
-			return nil, fmt.Errorf("worker %d returned %d-dim probe (expected %d)", i, len(probe), dims)
-		}
-		w := &workerCtx{model: model, ctx: ctx}
-		all = append(all, w)
-		pool <- w
+		all = append(all, ctx)
+		pool <- ctx
 	}
 
 	name := deriveModelName(opts.ModelPath)
 	return &localEmbedder{
+		model:     model,
 		pool:      pool,
 		all:       all,
 		modelName: name,
@@ -145,25 +148,15 @@ func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 	}, nil
 }
 
-func closeWorkers(ws []*workerCtx) {
-	for _, w := range ws {
-		if w.ctx != nil {
-			_ = w.ctx.Close()
-		}
-		if w.model != nil {
-			_ = w.model.Close()
-		}
-	}
-}
-
-// LocalEmbedderAvailable reports whether this binary has the local backend.
+// LocalEmbedderAvailable always returns true now that the backend
+// downloads itself. The function is kept for API compatibility with
+// the v0.1 build-tag stub.
 func LocalEmbedderAvailable() bool { return true }
 
-// Embed dispatches one text per worker via the pool semaphore.
-// gollama's GetEmbeddingsBatch packs all tokens into a single
-// llama_batch which a 2048-ctx BERT-class encoder overflows on the
-// first long chunk; we deliberately stay one-text-per-call and rely
-// on the worker pool for concurrency instead.
+// Embed dispatches one text per worker via the context pool.
+// Callers wanting parallelism construct the Embedder with
+// LocalEmbedderOptions.Workers > 1; otherwise the channel has a
+// single context and Embed is sequential.
 func (e *localEmbedder) Embed(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -172,14 +165,14 @@ func (e *localEmbedder) Embed(texts []string) ([][]float32, error) {
 		return nil, errors.New("local embedder is closed")
 	}
 	out := make([][]float32, len(texts))
+
 	if cap(e.pool) <= 1 {
-		// Single-worker fast path: no goroutines, no channel ops.
-		w := <-e.pool
-		defer func() { e.pool <- w }()
+		ctx := <-e.pool
+		defer func() { e.pool <- ctx }()
 		for i, t := range texts {
-			v, err := w.ctx.GetEmbeddings(t)
+			v, err := embedOne(ctx, e.model, e.dims, t)
 			if err != nil {
-				return nil, fmt.Errorf("embed: %w", err)
+				return nil, fmt.Errorf("embed (text %d): %w", i, err)
 			}
 			out[i] = v
 		}
@@ -193,9 +186,9 @@ func (e *localEmbedder) Embed(texts []string) ([][]float32, error) {
 		i, t := i, t
 		go func() {
 			defer wg.Done()
-			w := <-e.pool
-			defer func() { e.pool <- w }()
-			v, err := w.ctx.GetEmbeddings(t)
+			ctx := <-e.pool
+			defer func() { e.pool <- ctx }()
+			v, err := embedOne(ctx, e.model, e.dims, t)
 			if err != nil {
 				errs <- fmt.Errorf("embed (text %d): %w", i, err)
 				return
@@ -215,24 +208,20 @@ func (e *localEmbedder) EmbedSingle(text string) ([]float32, error) {
 	if e.isClosed() {
 		return nil, errors.New("local embedder is closed")
 	}
-	w := <-e.pool
-	defer func() { e.pool <- w }()
-	v, err := w.ctx.GetEmbeddings(text)
-	if err != nil {
-		return nil, fmt.Errorf("embed: %w", err)
-	}
-	return v, nil
+	ctx := <-e.pool
+	defer func() { e.pool <- ctx }()
+	return embedOne(ctx, e.model, e.dims, text)
 }
+
+func (e *localEmbedder) Dimensions() int       { return e.dims }
+func (e *localEmbedder) ModelName() string     { return e.modelName }
+func (e *localEmbedder) Family() PromptFamily  { return e.family }
 
 func (e *localEmbedder) isClosed() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.closed
 }
-
-func (e *localEmbedder) Dimensions() int       { return e.dims }
-func (e *localEmbedder) ModelName() string     { return e.modelName }
-func (e *localEmbedder) Family() PromptFamily  { return e.family }
 
 func (e *localEmbedder) Close() error {
 	e.mu.Lock()
@@ -241,12 +230,100 @@ func (e *localEmbedder) Close() error {
 		return nil
 	}
 	e.closed = true
-	closeWorkers(e.all)
+	closeContexts(e.all)
+	gollama.Model_free(e.model)
 	return nil
 }
 
+func closeContexts(ctxs []gollama.LlamaContext) {
+	for _, c := range ctxs {
+		gollama.Free(c)
+	}
+}
+
+// embedOne runs a full tokenize → batch → decode → get_embeddings
+// cycle for a single text and returns the L2-normalised vector.
+//
+// dianlight's batch struct is a thin shell over the C llama_batch;
+// fields like Token / Pos / SeqId / Logits are pointers we have to
+// fill via unsafe.Pointer slice gymnastics. The pattern is taken
+// from dianlight's own examples/embedding/main.go; if dianlight
+// ever wraps it in a higher-level helper we should switch to that.
+func embedOne(ctx gollama.LlamaContext, model gollama.LlamaModel, dims int, text string) ([]float32, error) {
+	tokens, err := gollama.Tokenize(model, text, true, true)
+	if err != nil {
+		return nil, fmt.Errorf("tokenize: %w", err)
+	}
+	if len(tokens) == 0 {
+		return nil, errors.New("tokenizer produced zero tokens")
+	}
+	if len(tokens) > math.MaxInt32 {
+		return nil, fmt.Errorf("text too long: %d tokens", len(tokens))
+	}
+
+	batch := gollama.Batch_init(int32(len(tokens)), 0, 1)
+	defer gollama.Batch_free(batch)
+
+	// Fill the batch in place. Each token at position i, sequence 0,
+	// with logits flag set so the encoder produces an output for it.
+	addTokensToBatch(&batch, tokens, 0)
+
+	if err := gollama.Decode(ctx, batch); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	embPtr := gollama.Get_embeddings(ctx)
+	if embPtr == nil {
+		return nil, errors.New("get_embeddings returned nil")
+	}
+	src := unsafe.Slice(embPtr, dims)
+	out := make([]float32, dims)
+	copy(out, src)
+	l2Normalize(out)
+	return out, nil
+}
+
+// addTokensToBatch mirrors the helper from dianlight's embedding
+// example. The C llama_batch struct exposes its arrays as raw
+// pointers; we cast them to large arrays via unsafe.Pointer and
+// write fields in place.
+func addTokensToBatch(batch *gollama.LlamaBatch, tokens []gollama.LlamaToken, seqID gollama.LlamaSeqId) {
+	tokensPtr := (*[1 << 20]gollama.LlamaToken)(unsafe.Pointer(batch.Token))
+	posPtr := (*[1 << 20]gollama.LlamaPos)(unsafe.Pointer(batch.Pos))
+	seqIDPtr := (*[1 << 20]*gollama.LlamaSeqId)(unsafe.Pointer(batch.SeqId))
+	logitsPtr := (*[1 << 20]int8)(unsafe.Pointer(batch.Logits))
+
+	seq := seqID
+	for i, tok := range tokens {
+		tokensPtr[i] = tok
+		posPtr[i] = gollama.LlamaPos(i)
+		seqIDPtr[i] = &seq
+		logitsPtr[i] = 1
+	}
+	batch.NTokens = int32(len(tokens))
+}
+
+// l2Normalize scales v in place so its L2 norm is 1. nomic-embed-text
+// (and most modern BERT-class embedders) return normalised vectors
+// only when explicitly asked; we normalise here so cosine similarity
+// at the vec0 layer matches what the model card describes.
+func l2Normalize(v []float32) {
+	var sum float64
+	for _, x := range v {
+		sum += float64(x) * float64(x)
+	}
+	norm := math.Sqrt(sum)
+	if norm == 0 {
+		return
+	}
+	for i := range v {
+		v[i] = float32(float64(v[i]) / norm)
+	}
+}
+
 // deriveModelName turns "/x/y/nomic-embed-text-v1.5.Q8_0.gguf" into
-// "nomic-embed-text-v1.5.Q8_0".
+// "nomic-embed-text-v1.5.Q8_0" — same as the godeps-era helper, kept
+// here so call sites don't need to change.
 func deriveModelName(path string) string {
 	base := path
 	for i := len(path) - 1; i >= 0; i-- {

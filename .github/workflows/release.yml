@@ -184,17 +184,29 @@ jobs:
 
             def install
               bin.install "recall"
+              # Cobra emits shell completions on demand; this helper
+              # picks the right per-shell directory under Homebrew's
+              # fpath so users get tab-completion without any
+              # post-install setup.
+              generate_completions_from_executable(bin/"recall", "completion")
             end
 
             def caveats
               <<~EOS
-                recall is installed without the local GGUF embedding backend
-                (~146 MB model). To enable vector / hybrid search, either:
-                  * rebuild from source with -tags 'sqlite_fts5 embed_llama'
-                    (requires libbinding.a — see github.com/ugurcan-aytar/recall),
-                  * or set RECALL_EMBED_PROVIDER=openai|voyage and an API key.
+                Local GGUF embedding ships baked in. The first time you run
+                'recall embed' (or 'recall query --expand|--rerank|--hyde'),
+                recall downloads the platform llama.cpp shared library
+                (~100 MB, one-time) into ~/.cache/gollama/libs/. Afterwards
+                everything runs offline.
 
-                BM25 full-text search via 'recall search' works out of the box.
+                For the embedding model itself:
+                  recall models download              # nomic-embed-text-v1.5 (~146 MB)
+                  recall models download --expansion  # qmd-query-expansion-1.7B (~1.3 GB)
+                  recall models download --reranker   # Qwen2.5-1.5B-Instruct (~1.1 GB)
+
+                Or skip the local model entirely with an API embedder:
+                  export RECALL_EMBED_PROVIDER=openai|voyage
+                  export OPENAI_API_KEY=...   # or VOYAGE_API_KEY
               EOS
             end
 

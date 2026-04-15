@@ -250,7 +250,7 @@ The pieces:
 
 - **store** — `mattn/go-sqlite3` (with the `sqlite_fts5` build tag) plus `asg017/sqlite-vec-go-bindings/cgo`. WAL mode, 64 MB cache, prepared statements cached for the BM25 hot path.
 - **chunk** — markdown break-point scoring is the default. Code files route through `smacker/go-tree-sitter` for AST-aware cuts. Strategy is overridable via `--chunk-strategy auto|regex|ast`.
-- **embed** — local GGUF via `godeps/gollama` is the default; the binary keeps the model loaded across the run for amortised load cost. BM25-only commands never load the model. Optional API fallback (`RECALL_EMBED_PROVIDER=openai|voyage`) is opt-in only and never default.
+- **embed** — local GGUF via `dianlight/gollama.cpp` is the default. The library is purego (no CGo for inference) and downloads its platform-specific llama.cpp shared library on first use to `~/.cache/gollama/libs/` (~100 MB, one-time). After that, the binary keeps the model loaded across the run for amortised load cost. BM25-only commands never load the model. Optional API fallback (`RECALL_EMBED_PROVIDER=openai|voyage`) is opt-in only and never default.
 - **pkg/recall** — a stable facade (`NewEngine`, `SearchBM25`, `SearchVector`, `SearchHybrid`, `Index`, `Embed`, `Get`, …) that external Go consumers import.
 
 ## Installation
@@ -304,7 +304,7 @@ recall query "your question"
 
 `RECALL_EMBED_PROVIDER` defaults to `local`, so the API path is opt-in only — recall never sends data anywhere unless you explicitly set the env var.
 
-**Source builds**: rebuild with the `embed_llama` tag to get the in-process GGUF embedder. The recipe (libbinding.a, model download) is in [CONTRIBUTING.md](CONTRIBUTING.md). Once built, `recall models download` fetches the default model and `recall embed` runs entirely on-device.
+**Pre-built binaries include local GGUF embedding.** No source build needed. The first `recall embed` (or `recall query --expand|--rerank|--hyde`) downloads the platform llama.cpp shared library (~100 MB) into `~/.cache/gollama/libs/`, after which everything runs offline. Use `recall models download` to fetch the embedding model itself; `--expansion` and `--reranker` add the LLMs for the optional flags.
 
 Run `recall doctor` any time to see which backend the current binary will use.
 
