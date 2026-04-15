@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ func TestQueryCmdFlags(t *testing.T) {
 	for _, name := range []string{
 		"limit", "collection", "all", "min-score", "full", "explain",
 		"json", "csv", "md", "xml", "files", "chunk-strategy",
-		"expand", "intent", "rerank", "rerank-top-n",
+		"expand", "hyde", "intent", "rerank", "rerank-top-n",
 	} {
 		if f := queryCmd.Flags().Lookup(name); f == nil {
 			t.Errorf("query missing --%s", name)
@@ -38,7 +39,7 @@ func TestRunExpansionDispatchesGenerator(t *testing.T) {
 	SetGeneratorOverride(gen)
 	t.Cleanup(func() { SetGeneratorOverride(nil) })
 
-	got, err := runExpansion("rate limiter")
+	got, err := runExpansion(nil, "rate limiter")
 	if err != nil {
 		t.Fatalf("runExpansion: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestRunExpansionWithoutModelDegrades(t *testing.T) {
 		t.Skip("binary built with embed_llama — degradation path not reachable")
 	}
 	SetGeneratorOverride(nil)
-	got, err := runExpansion("anything")
+	got, err := runExpansion(nil, "anything")
 	if err != nil {
 		t.Errorf("expected nil error on stub build, got %v", err)
 	}
@@ -164,4 +165,87 @@ func (k *keywordYesNoGen) Generate(prompt string, _ ...llm.GenerateOption) (stri
 		return "yes", nil
 	}
 	return "no", nil
+}
+
+// recordingGen captures every prompt it sees so collection-context
+// auto-intent can be asserted on directly.
+type recordingGen struct {
+	llm.MockGenerator
+	last string
+}
+
+func (r *recordingGen) Generate(prompt string, _ ...llm.GenerateOption) (string, error) {
+	r.last = prompt
+	// Return a canned expansion that has hyde lines so HyDE wiring
+	// has something to embed downstream.
+	return "lex: rate limiter\nvec: how does the rate limiter handle bursts\nhyde: A rate limiter caps requests per second using token bucket.", nil
+}
+
+// TestRunExpansionAutoFillsIntentFromCollectionContext exercises
+// the qmd-fix: when --intent is unset and a single -c collection
+// has a Context blurb, runExpansion threads it as the intent line
+// so HyDE / expansion stays domain-aware.
+func TestRunExpansionAutoFillsIntentFromCollectionContext(t *testing.T) {
+	rec := &recordingGen{}
+	SetGeneratorOverride(rec)
+	t.Cleanup(func() { SetGeneratorOverride(nil) })
+
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "i.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+	colDir := t.TempDir()
+	if _, err := s.AddCollection("notes", colDir, "", "API rate limiting and resilience patterns"); err != nil {
+		t.Fatalf("AddCollection: %v", err)
+	}
+
+	// Force the query to target our single collection so
+	// auto-intent kicks in. queryIntent stays empty.
+	prevCol, prevIntent := queryOpts.Collection, queryIntent
+	queryOpts.Collection = "notes"
+	queryIntent = ""
+	t.Cleanup(func() { queryOpts.Collection, queryIntent = prevCol, prevIntent })
+
+	if _, err := runExpansion(s, "rate limiter"); err != nil {
+		t.Fatalf("runExpansion: %v", err)
+	}
+	if !strings.Contains(rec.last, "Query intent: API rate limiting and resilience patterns") {
+		t.Errorf("expected auto-filled intent from collection context; prompt was:\n%s", rec.last)
+	}
+}
+
+// TestRunExpansionUserIntentBeatsCollectionContext confirms that
+// an explicit --intent flag wins over the auto-fill — users keep
+// the override knob.
+func TestRunExpansionUserIntentBeatsCollectionContext(t *testing.T) {
+	rec := &recordingGen{}
+	SetGeneratorOverride(rec)
+	t.Cleanup(func() { SetGeneratorOverride(nil) })
+
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "i.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.AddCollection("notes", t.TempDir(), "", "auto-intent collection context"); err != nil {
+		t.Fatal(err)
+	}
+
+	prevCol, prevIntent := queryOpts.Collection, queryIntent
+	queryOpts.Collection = "notes"
+	queryIntent = "explicit user intent"
+	t.Cleanup(func() { queryOpts.Collection, queryIntent = prevCol, prevIntent })
+
+	if _, err := runExpansion(s, "anything"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.last, "Query intent: explicit user intent") {
+		t.Errorf("expected user --intent to win; prompt:\n%s", rec.last)
+	}
+	if strings.Contains(rec.last, "auto-intent collection context") {
+		t.Errorf("collection context should NOT leak when --intent is set; prompt:\n%s", rec.last)
+	}
 }

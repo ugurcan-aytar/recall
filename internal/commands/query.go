@@ -22,6 +22,7 @@ var (
 	queryOpts          searchFlags
 	queryChunkStrategy string
 	queryExpand        bool
+	queryHyde          bool
 	queryIntent        string
 	queryRerank        bool
 	queryRerankTopN    int
@@ -81,32 +82,51 @@ var queryCmd = &cobra.Command{
 		}
 
 		// --expand fans the original query out into LLM-generated lex /
-		// vec variants. Each variant joins the same-side fan-out: lex
-		// variants get an extra BM25 call, vec variants get an extra
-		// embed + vector call. Same-side lists are then merged with a
-		// bonus on the original query before the final RRF fuse.
+		// vec variants; --hyde embeds the model's hypothetical answer
+		// passages and uses each as another vector query. Both flags
+		// share one expand.Expand call so a user running --expand
+		// --hyde pays for one model invocation, not two.
 		bm25Queries := []string{q}
 		vecQueries := []string{q}
-		if queryExpand {
-			expansion, err := runExpansion(q)
+		var hydeVectors [][]float32
+		if queryExpand || queryHyde {
+			expansion, err := runExpansion(s, q)
 			if err != nil {
 				return err
 			}
 			if expansion != nil {
-				bm25Queries = append(bm25Queries, expansion.Lex...)
-				vecQueries = append(vecQueries, expansion.Vec...)
+				if queryExpand {
+					bm25Queries = append(bm25Queries, expansion.Lex...)
+					vecQueries = append(vecQueries, expansion.Vec...)
+				}
+				if queryHyde {
+					// Each HyDE passage is a hypothetical document; embed
+					// it as a document so it lands in the same vector
+					// space as the real corpus, then SearchVector with
+					// each one as an extra query.
+					family := emb.Family()
+					for _, passage := range expansion.Hyde {
+						v, hyErr := emb.EmbedSingle(embed.FormatDocumentFor(family, "", passage))
+						if hyErr != nil {
+							fmt.Fprintln(os.Stderr,
+								"warning: HyDE embed failed for one passage — "+hyErr.Error())
+							continue
+						}
+						hydeVectors = append(hydeVectors, v)
+					}
+				}
 				if queryOpts.Explain {
 					fmt.Fprintf(os.Stderr,
-						"[explain] expansion produced %d lex + %d vec variants\n",
-						len(expansion.Lex), len(expansion.Vec))
+						"[explain] expansion produced %d lex + %d vec + %d hyde\n",
+						len(expansion.Lex), len(expansion.Vec), len(expansion.Hyde))
 				}
 			}
 		}
 
 		bm25Lists := make([][]store.SearchResult, len(bm25Queries))
-		vecLists := make([][]store.SearchResult, len(vecQueries))
+		vecLists := make([][]store.SearchResult, len(vecQueries)+len(hydeVectors))
 		bm25Errs := make([]error, len(bm25Queries))
-		vecErrs := make([]error, len(vecQueries))
+		vecErrs := make([]error, len(vecQueries)+len(hydeVectors))
 
 		var wg sync.WaitGroup
 		for i, bq := range bm25Queries {
@@ -138,6 +158,19 @@ var queryCmd = &cobra.Command{
 				vecLists[i], vecErrs[i] = s.SearchVector(v, store.SearchOptions{
 					Query: vq, Limit: oversample, Collection: queryOpts.Collection,
 				})
+			}()
+		}
+		// HyDE vectors join the same vector-search fan-out — each one
+		// is embedded against the doc-side prompt format and run
+		// through SearchVector exactly like the real-query embedding.
+		baseVecCount := len(vecQueries)
+		for hi, v := range hydeVectors {
+			hi, v := hi, v
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				vecLists[baseVecCount+hi], vecErrs[baseVecCount+hi] = s.SearchVector(v,
+					store.SearchOptions{Query: q, Limit: oversample, Collection: queryOpts.Collection})
 			}()
 		}
 		wg.Wait()
@@ -367,25 +400,39 @@ func applyRerank(fused []store.FusedResult, q string) []store.FusedResult {
 // nil return so the rest of `recall query` continues with the
 // original query unchanged. Hard errors (model present but
 // generation failed) propagate so the user notices.
-func runExpansion(q string) (*expand.Expanded, error) {
+//
+// Auto-intent: when --intent isn't set explicitly AND a single
+// collection is targeted AND that collection has a context blurb,
+// the blurb gets passed as the intent line so the LLM can
+// disambiguate domain-specific queries. qmd skipped this for HyDE
+// generation and the resulting hypothetical passages were noticeably
+// less on-topic; recall fixes that here.
+func runExpansion(s *store.Store, q string) (*expand.Expanded, error) {
 	gen, err := openGenerator()
 	if err != nil {
 		if errors.Is(err, llm.ErrLocalGeneratorNotCompiled) {
 			fmt.Fprintln(os.Stderr,
-				"warning: --expand requires the embed_llama build; rebuild from source or drop the flag")
+				"warning: --expand / --hyde requires the embed_llama build; rebuild from source or drop the flag")
 			return nil, nil
 		}
-		// Missing model file — print the actionable hint and continue.
 		if os.IsNotExist(err) || strings.Contains(err.Error(), "expansion model not found") {
-			fmt.Fprintln(os.Stderr, "warning: --expand requested but model missing — "+err.Error())
+			fmt.Fprintln(os.Stderr, "warning: --expand / --hyde requested but model missing — "+err.Error())
 			return nil, nil
 		}
 		return nil, err
 	}
 	defer gen.Close()
 
+	intent := queryIntent
+	if intent == "" && queryOpts.Collection != "" && s != nil {
+		if c, lookupErr := s.GetCollectionByName(queryOpts.Collection); lookupErr == nil &&
+			c != nil && c.Context != "" {
+			intent = c.Context
+		}
+	}
+
 	return expand.Expand(gen, q, expand.Options{
-		Intent:     queryIntent,
+		Intent:     intent,
 		IncludeLex: true,
 	})
 }
@@ -399,8 +446,10 @@ func init() {
 	queryCmd.Flags().BoolVar(&queryOpts.Explain, "explain", false, "show RRF / bonus / floor trace per result")
 	queryCmd.Flags().BoolVar(&queryExpand, "expand", false,
 		"expand the query into LLM-generated lex + vec variants (requires `recall models download --expansion`)")
+	queryCmd.Flags().BoolVar(&queryHyde, "hyde", false,
+		"generate a hypothetical answer passage and use its embedding as an extra vector query (requires `recall models download --expansion`)")
 	queryCmd.Flags().StringVar(&queryIntent, "intent", "",
-		"optional one-line intent passed to the expansion LLM (e.g. \"web performance\"); ignored without --expand")
+		"optional one-line intent passed to the expansion LLM (e.g. \"web performance\"); auto-fills from the active collection's context when unset and a single -c collection is targeted")
 	queryCmd.Flags().BoolVar(&queryRerank, "rerank", false,
 		"rerank the top-N RRF results through a binary-relevance LLM (requires `recall models download --reranker`)")
 	queryCmd.Flags().IntVar(&queryRerankTopN, "rerank-top-n", 0,

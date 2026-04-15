@@ -353,6 +353,39 @@ parsing expects `lex: …` / `vec: …` / `hyde: …` lines (the qmd
 expansion-model format); a model that emits anything else won't
 crash but won't produce useful variants either.
 
+### HyDE — embedding hypothetical answers (`--hyde`)
+
+`--hyde` (Hypothetical Document Embedding) asks the same expansion
+LLM to write a short imagined answer to the query, then embeds that
+hypothetical passage in the same vector space as your real
+documents. Vector search runs against both the real query embedding
+AND the hypothetical-answer embedding; results are RRF-fused.
+
+The intuition: if the user types "what's the recovery timeout for
+the circuit breaker pattern?", a real document about circuit
+breakers is more likely to land near a *hypothetical answer* about
+circuit breakers than near the bare *question*. The hypothetical
+acts as a richer query.
+
+```sh
+# Same model + download as --expand:
+recall models download --expansion
+
+recall query --hyde "what is the recovery timeout for the circuit breaker"
+recall query --expand --hyde "what did the team decide about authentication"
+```
+
+`--expand` and `--hyde` share one LLM call when both flags are on
+— the qmd-format model emits `lex / vec / hyde` in a single
+response, so there's no extra cost for combining them.
+
+**Auto-intent fix**: when you target a single collection (`-c`)
+and that collection has a context blurb (`recall collection add
+--context "…"`), recall passes the blurb as `Query intent: …` to
+the LLM. qmd skipped this for HyDE generation and the resulting
+hypothetical passages were noticeably less on-topic; recall fixes
+that. An explicit `--intent` flag still wins over the auto-fill.
+
 ### Reranking (`--rerank`)
 
 `--rerank` sends the top-N RRF results through a small instruction-
