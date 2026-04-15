@@ -43,26 +43,43 @@ var modelsListCmd = &cobra.Command{
 }
 
 var (
-	modelsDownloadURL  string
-	modelsDownloadHash string
-	modelsDownloadDest string
+	modelsDownloadURL       string
+	modelsDownloadHash      string
+	modelsDownloadDest      string
+	modelsDownloadExpansion bool
 )
 
 var modelsDownloadCmd = &cobra.Command{
 	Use:   "download",
-	Short: "Download the default embedding model (or a custom URL)",
+	Short: "Download the default embedding model (or, with --expansion, the LLM used by --expand / --hyde)",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Pick the default URL + filename based on which model the
+		// user is asking for. Explicit --url or --dest still wins.
+		defaultURL := embed.DefaultModelURL
+		defaultName := embed.DefaultModelName
+		label := "embedding model"
+		if modelsDownloadExpansion {
+			defaultURL = embed.DefaultExpansionModelURL
+			defaultName = embed.DefaultExpansionModelName
+			label = "expansion / HyDE LLM"
+		}
+
 		dest := modelsDownloadDest
 		if dest == "" {
 			var err error
-			dest, err = embed.ResolveModelPath(embed.DefaultModelName)
+			dest, err = embed.ResolveModelPath(defaultName)
 			if err != nil {
 				return err
 			}
 		}
-		fmt.Printf("Downloading model to %s\n", dest)
+		url := modelsDownloadURL
+		if url == "" {
+			url = defaultURL
+		}
+
+		fmt.Printf("Downloading %s to %s\n", label, dest)
 		path, err := embed.DownloadModel(embed.DownloadOptions{
-			URL:          modelsDownloadURL,
+			URL:          url,
 			DestPath:     dest,
 			ExpectedHash: modelsDownloadHash,
 			Progress:     downloadProgress,
@@ -103,6 +120,8 @@ func init() {
 	modelsDownloadCmd.Flags().StringVar(&modelsDownloadURL, "url", "", "override download URL")
 	modelsDownloadCmd.Flags().StringVar(&modelsDownloadHash, "sha256", "", "expected SHA-256 (hex)")
 	modelsDownloadCmd.Flags().StringVar(&modelsDownloadDest, "dest", "", "override destination path")
+	modelsDownloadCmd.Flags().BoolVar(&modelsDownloadExpansion, "expansion", false,
+		"download the query-expansion / HyDE LLM (qmd-query-expansion-1.7B, ~1.3 GB) instead of the embedding model")
 
 	modelsCmd.AddCommand(modelsListCmd, modelsDownloadCmd, modelsPathCmd)
 }

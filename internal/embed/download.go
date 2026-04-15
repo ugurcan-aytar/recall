@@ -44,6 +44,32 @@ func ResolveActiveModelPath() (string, error) {
 // model. Override per-call via DownloadOptions.URL when mirroring locally.
 const DefaultModelURL = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
 
+// DefaultExpansionModelName is the GGUF generation model recall uses
+// for query expansion (--expand) and HyDE (--hyde). The model is a
+// fine-tune of Qwen3-1.7B that emits structured `lex: …`, `vec: …`,
+// `hyde: …` lines — exactly the shape recall's expansion + HyDE
+// pipeline consumes — so one model load covers both features.
+//
+// Source: tobil/qmd-query-expansion-1.7B-gguf (MIT, ungated).
+// Override per-installation with $RECALL_EXPAND_MODEL.
+const DefaultExpansionModelName = "qmd-query-expansion-1.7B-q4_k_m.gguf"
+
+// DefaultExpansionModelURL is the canonical HuggingFace location.
+const DefaultExpansionModelURL = "https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf/resolve/main/qmd-query-expansion-1.7B-q4_k_m.gguf"
+
+// ResolveActiveExpansionModelPath returns the GGUF file recall should
+// load for query expansion / HyDE, honouring $RECALL_EXPAND_MODEL.
+// Bare filename joins with [ModelsDir]; absolute path passes through.
+func ResolveActiveExpansionModelPath() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("RECALL_EXPAND_MODEL")); v != "" {
+		if filepath.IsAbs(v) {
+			return v, nil
+		}
+		return ResolveModelPath(v)
+	}
+	return ResolveModelPath(DefaultExpansionModelName)
+}
+
 // DownloadOptions configures a model fetch.
 type DownloadOptions struct {
 	URL          string                       // download source; "" ⇒ DefaultModelURL

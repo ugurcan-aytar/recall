@@ -11,13 +11,24 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ugurcan-aytar/recall/internal/embed"
+	"github.com/ugurcan-aytar/recall/internal/expand"
+	"github.com/ugurcan-aytar/recall/internal/llm"
 	"github.com/ugurcan-aytar/recall/internal/store"
 )
 
 var (
 	queryOpts          searchFlags
 	queryChunkStrategy string
+	queryExpand        bool
+	queryIntent        string
 )
+
+// originalListBonus is the extra weight applied to the user's literal
+// query when same-side rank lists are merged via store.MergeRankLists.
+// qmd uses 1.0 (= "first list counts twice"); recall mirrors that for
+// the expansion path so aggressive variants can't shove the user's
+// own phrasing off the result list.
+const originalListBonus = 1.0
 
 var queryCmd = &cobra.Command{
 	Use:   "query <query>",
@@ -65,31 +76,82 @@ var queryCmd = &cobra.Command{
 			oversample = 40
 		}
 
-		var (
-			wg                       sync.WaitGroup
-			bm25Results, vecResults  []store.SearchResult
-			bm25Err, vecErr          error
-		)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			bm25Results, bm25Err = s.SearchBM25(store.SearchOptions{
-				Query: q, Limit: oversample, Collection: queryOpts.Collection,
-			})
-		}()
-		go func() {
-			defer wg.Done()
-			vecResults, vecErr = s.SearchVector(queryVec, store.SearchOptions{
-				Query: q, Limit: oversample, Collection: queryOpts.Collection,
-			})
-		}()
+		// --expand fans the original query out into LLM-generated lex /
+		// vec variants. Each variant joins the same-side fan-out: lex
+		// variants get an extra BM25 call, vec variants get an extra
+		// embed + vector call. Same-side lists are then merged with a
+		// bonus on the original query before the final RRF fuse.
+		bm25Queries := []string{q}
+		vecQueries := []string{q}
+		if queryExpand {
+			expansion, err := runExpansion(q)
+			if err != nil {
+				return err
+			}
+			if expansion != nil {
+				bm25Queries = append(bm25Queries, expansion.Lex...)
+				vecQueries = append(vecQueries, expansion.Vec...)
+				if queryOpts.Explain {
+					fmt.Fprintf(os.Stderr,
+						"[explain] expansion produced %d lex + %d vec variants\n",
+						len(expansion.Lex), len(expansion.Vec))
+				}
+			}
+		}
+
+		bm25Lists := make([][]store.SearchResult, len(bm25Queries))
+		vecLists := make([][]store.SearchResult, len(vecQueries))
+		bm25Errs := make([]error, len(bm25Queries))
+		vecErrs := make([]error, len(vecQueries))
+
+		var wg sync.WaitGroup
+		for i, bq := range bm25Queries {
+			i, bq := i, bq
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				bm25Lists[i], bm25Errs[i] = s.SearchBM25(store.SearchOptions{
+					Query: bq, Limit: oversample, Collection: queryOpts.Collection,
+				})
+			}()
+		}
+		for i, vq := range vecQueries {
+			i, vq := i, vq
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var v []float32
+				if vq == q {
+					v = queryVec
+				} else {
+					var embErr error
+					v, embErr = embedQueryCached(emb, vq)
+					if embErr != nil {
+						vecErrs[i] = fmt.Errorf("embed expanded query %q: %w", vq, embErr)
+						return
+					}
+				}
+				vecLists[i], vecErrs[i] = s.SearchVector(v, store.SearchOptions{
+					Query: vq, Limit: oversample, Collection: queryOpts.Collection,
+				})
+			}()
+		}
 		wg.Wait()
-		if bm25Err != nil {
-			return fmt.Errorf("bm25: %w", bm25Err)
+		for _, err := range bm25Errs {
+			if err != nil {
+				return fmt.Errorf("bm25: %w", err)
+			}
 		}
-		if vecErr != nil {
-			return fmt.Errorf("vector: %w", vecErr)
+		for _, err := range vecErrs {
+			if err != nil {
+				return fmt.Errorf("vector: %w", err)
+			}
 		}
+
+		// Same-side merge — 1 list pass-through, N lists rank-fuse
+		// with a bonus on the original (first) entry.
+		bm25Results := store.MergeRankLists(bm25Lists, store.DefaultFusionOptions(), originalListBonus)
+		vecResults := store.MergeRankLists(vecLists, store.DefaultFusionOptions(), originalListBonus)
 
 		fused := store.FuseRRF(bm25Results, vecResults, store.DefaultFusionOptions())
 
@@ -218,6 +280,34 @@ func writeFusedJSON(results []store.FusedResult) error {
 	return enc.Encode(out)
 }
 
+// runExpansion drives the LLM expansion model. Errors that mean
+// "model isn't installed" are downgraded to a stderr warning and a
+// nil return so the rest of `recall query` continues with the
+// original query unchanged. Hard errors (model present but
+// generation failed) propagate so the user notices.
+func runExpansion(q string) (*expand.Expanded, error) {
+	gen, err := openGenerator()
+	if err != nil {
+		if errors.Is(err, llm.ErrLocalGeneratorNotCompiled) {
+			fmt.Fprintln(os.Stderr,
+				"warning: --expand requires the embed_llama build; rebuild from source or drop the flag")
+			return nil, nil
+		}
+		// Missing model file — print the actionable hint and continue.
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "expansion model not found") {
+			fmt.Fprintln(os.Stderr, "warning: --expand requested but model missing — "+err.Error())
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer gen.Close()
+
+	return expand.Expand(gen, q, expand.Options{
+		Intent:     queryIntent,
+		IncludeLex: true,
+	})
+}
+
 func init() {
 	queryCmd.Flags().IntVarP(&queryOpts.Limit, "limit", "n", 0, "number of results (default 5, 20 for --json/--files)")
 	queryCmd.Flags().StringVarP(&queryOpts.Collection, "collection", "c", "", "restrict to a collection")
@@ -225,6 +315,10 @@ func init() {
 	queryCmd.Flags().Float64Var(&queryOpts.MinScore, "min-score", 0, "minimum fused-score threshold (in addition to adaptive floor)")
 	queryCmd.Flags().BoolVar(&queryOpts.Full, "full", false, "show full document content")
 	queryCmd.Flags().BoolVar(&queryOpts.Explain, "explain", false, "show RRF / bonus / floor trace per result")
+	queryCmd.Flags().BoolVar(&queryExpand, "expand", false,
+		"expand the query into LLM-generated lex + vec variants (requires `recall models download --expansion`)")
+	queryCmd.Flags().StringVar(&queryIntent, "intent", "",
+		"optional one-line intent passed to the expansion LLM (e.g. \"web performance\"); ignored without --expand")
 
 	queryCmd.Flags().BoolVar(&queryOpts.JSON, "json", false, "JSON output")
 	queryCmd.Flags().BoolVar(&queryOpts.CSV, "csv", false, "CSV output")

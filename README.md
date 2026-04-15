@@ -287,6 +287,7 @@ Run `recall doctor` any time to see which backend the current binary will use.
 | `RECALL_EMBED_MODEL` | `nomic-embed-text-v1.5.Q8_0.gguf` | Override the local GGUF — bare filename joined with `RECALL_MODELS_DIR`, or absolute path |
 | `RECALL_EMBED_PROMPT_FORMAT` | _detected from filename_ | Force a prompt family — `nomic`, `gemma` / `embeddinggemma`, `qwen` / `qwen3`, or `generic` / `raw` / `none` |
 | `RECALL_EMBED_WORKERS` | `1` | Parallel embedder workers. Local backend loads N model instances (~146 MB each); API backend fires N concurrent HTTP requests. Capped at 8. |
+| `RECALL_EXPAND_MODEL` | `qmd-query-expansion-1.7B-q4_k_m.gguf` | Override the GGUF used by `--expand` and (eventually) `--hyde`. Bare filename joins with `RECALL_MODELS_DIR`; absolute path passes through. |
 | `OPENAI_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=openai` |
 | `VOYAGE_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=voyage` |
 | `NO_COLOR` | — | Set to any value to disable ANSI colors |
@@ -313,6 +314,43 @@ applied. Set `RECALL_EMBED_PROMPT_FORMAT` if you have a model whose
 filename doesn't hint at its family. The model dimension must match
 recall's vec0 schema (768d); embedders that return a different width
 will fail at `recall embed` with a clear error.
+
+### Query expansion (`--expand`)
+
+`recall query` runs BM25 + vector + RRF on the user's literal query.
+For natural-language questions where the query and the doc use
+different vocabulary ("decide" vs "decisions"), even hybrid search can
+miss obvious matches. `--expand` asks a small local LLM to rewrite the
+query into a few BM25-friendly keyword variants and a few semantic
+phrasings, then fuses the extra retrieval lists with a 2× weight on
+the user's original phrasing so aggressive variants can't out-vote it.
+
+```sh
+# One-time: download the expansion model (qmd-query-expansion-1.7B,
+# MIT-licensed, ungated, ~1.3 GB GGUF). Same library backs --expand
+# now and --hyde when that lands.
+recall models download --expansion
+
+# Use the flag on any hybrid query.
+recall query --expand "what did the team decide about authentication"
+
+# Optional intent line to disambiguate two-word nouns ("performance"
+# could mean web latency, financial returns, athletic, …).
+recall query --expand --intent "web page latency" "performance"
+```
+
+The flag is opt-in for two reasons: the expansion model is an extra
+~1.3 GB download, and each `--expand` query pays one LLM-inference
+roundtrip (~1-3s on a modern laptop). Without the flag — or when the
+model isn't downloaded — `recall query` runs the original
+single-query hybrid path with zero LLM cost.
+
+To swap the model out for a different generation GGUF (e.g. you want
+to A/B against Qwen2.5-1.5B-Instruct), drop it under
+`RECALL_MODELS_DIR` and set `RECALL_EXPAND_MODEL=my-llm.gguf`. Output
+parsing expects `lex: …` / `vec: …` / `hyde: …` lines (the qmd
+expansion-model format); a model that emits anything else won't
+crash but won't produce useful variants either.
 
 ### Speeding up `recall embed` with parallel workers
 

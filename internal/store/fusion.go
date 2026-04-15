@@ -33,6 +33,73 @@ func DefaultFusionOptions() FusionOptions {
 	}
 }
 
+// MergeRankLists folds N same-side result lists (e.g. BM25 results
+// from the original query plus its expansion variants) into one
+// ranked list. Each doc's score becomes the RRF-style sum of
+// 1/(k+rank) across every list it appears in, with k taken from
+// FusionOptions.K. The first list is given an extra weight of
+// firstListBonus on top of its rank contribution — this matches qmd's
+// "first query gets 2× weight" rule and protects the user's literal
+// query from being out-voted by aggressive expansions.
+//
+// The Score field on each output SearchResult is overwritten with
+// the merged rank-fusion score (callers that need the absolute BM25
+// or vector score should look at the input lists). The Snippet,
+// Title, Path, etc. come from whichever list ranked the doc highest.
+func MergeRankLists(lists [][]SearchResult, opts FusionOptions, firstListBonus float64) []SearchResult {
+	if len(lists) == 0 {
+		return nil
+	}
+	if len(lists) == 1 {
+		return append([]SearchResult(nil), lists[0]...)
+	}
+	k := opts.K
+	if k <= 0 {
+		k = 60
+	}
+
+	scores := map[string]float64{}
+	bestSample := map[string]SearchResult{}
+	bestRank := map[string]int{}
+
+	for li, list := range lists {
+		bonus := 1.0
+		if li == 0 && firstListBonus > 0 {
+			bonus = 1.0 + firstListBonus
+		}
+		for rank, r := range list {
+			doc := docKey(r)
+			scores[doc] += bonus / (k + float64(rank+1))
+			if cur, ok := bestRank[doc]; !ok || rank < cur {
+				bestRank[doc] = rank
+				bestSample[doc] = r
+			}
+		}
+	}
+
+	out := make([]SearchResult, 0, len(scores))
+	for doc, s := range scores {
+		r := bestSample[doc]
+		r.Score = s
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Score > out[j].Score
+	})
+	return out
+}
+
+// docKey returns a stable identifier for a SearchResult suitable for
+// cross-list deduplication. Falls back to path+collection when the
+// upstream doc_id is empty (rare — should only happen for synthetic
+// fixtures in tests).
+func docKey(r SearchResult) string {
+	if r.DocID != "" {
+		return r.DocID
+	}
+	return r.CollectionName + "/" + r.Path
+}
+
 // FusedResult is one row of fused output. Trace is populated when the
 // caller requests an --explain breakdown.
 type FusedResult struct {
