@@ -564,7 +564,19 @@ Bug reports, feature requests, and PRs are welcome. See [CONTRIBUTING.md](CONTRI
 
 ## Credits
 
-recall's architecture is inspired by [qmd](https://github.com/tobi/qmd) by Tobi Lütke — the chunking strategy, RRF fusion, and overall shape of the CLI owe a lot to that project. recall diverges in a few places (no separate reranker model, no query-expansion model, incremental re-embedding, adaptive min-score, AST-aware code chunking from day one) — those are deliberate, not accidental.
+recall's architecture is inspired by [qmd](https://github.com/tobi/qmd) by Tobi Lütke — the chunking strategy (900-token target with break-point scoring), RRF fusion with top-rank bonus + adaptive min-score, and the overall shape of the CLI all trace back to that project.
+
+recall diverges in a few places:
+
+- **Go, not TypeScript/Bun.** Single static binary, no Node runtime, importable as a library via `pkg/recall` (brain is the primary library consumer).
+- **SQLite-vec for vector search** (`asg017/sqlite-vec-go-bindings`) in the same `mattn/go-sqlite3` database as FTS5 BM25 — one file, one connection, one transaction boundary across hybrid queries.
+- **AST-aware code chunking from day one** via `smacker/go-tree-sitter` — Go, Python, TypeScript, Java, Rust parse into syntax-respecting chunks instead of regex-sliced windows.
+- **Incremental embedding** — `chunks.content_hash` gates the re-run, so only modified chunks re-embed on `recall embed`. Full-corpus re-embeds happen only with `-f`.
+- **Subprocess-based inference** — local embedding and generation both shell out to llama.cpp's official `llama-server` prebuilt on a Unix socket (auto-downloaded on first use, ~21 MB extracted, no CGo on the inference path). Gives recall real cross-encoder reranking via `/v1/rerank` and chat-template-aware generation via `/v1/chat/completions`, without vendoring any llama.cpp binding.
+- **Cross-encoder reranker**: [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) at Q4_K_M (~418 MB, Apache 2.0, multilingual 568M params). Continuous 0-1 relevance scoring, position-aware blended with RRF rank (top-3: 75/25, ranks 4-10: 60/40, ranks 11+: 40/60).
+- **Query expansion + HyDE**: [qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) via Tobi — the expansion model from qmd is what powers `recall query --expand` and the hypothetical passages for `--hyde`.
+- **Named indexes via `--index`** — isolated SQLite DBs at `~/.recall/indexes/<name>.db` so users can keep `work` / `personal` / `code` knowledge bases cleanly separated from one binary.
+- **`recall bench`** — JSONL-driven IR quality benchmark with Precision@k, Recall@k, MRR across `bm25 | vector | hybrid` modes.
 
 ## License
 
