@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -9,8 +10,9 @@ import (
 )
 
 var (
-	dbPath  string
-	noColor bool
+	dbPath    string
+	indexName string
+	noColor   bool
 )
 
 var rootCmd = &cobra.Command{
@@ -24,11 +26,51 @@ func Execute() error {
 	return rootCmd.Execute()
 }
 
-// openStore opens a *store.Store honouring the --db flag, then the
-// RECALL_DB_PATH env var, then the default path. Centralised here so every
-// subcommand opens the same way.
+// resolveStorePath picks the DB file honouring, in order:
+//
+//  1. --db (explicit file path; highest priority, wins over everything)
+//  2. $RECALL_DB_PATH (env var; for CI / scripted path overrides)
+//  3. --index <name> (mapped to ~/.recall/indexes/<name>.db)
+//  4. DefaultDBPath (~/.recall/index.db)
+//
+// When --index AND a path-setter (--db or $RECALL_DB_PATH) both
+// appear, --index is ignored and a warning goes to stderr — the
+// path-setter is more explicit about which file to touch and
+// silently dropping it would be worse than the warning noise.
+func resolveStorePath() (string, error) {
+	envPath := os.Getenv("RECALL_DB_PATH")
+
+	if dbPath != "" || envPath != "" {
+		if indexName != "" {
+			fmt.Fprintf(os.Stderr,
+				"warning: --index %q ignored because %s is set\n",
+				indexName,
+				func() string {
+					if dbPath != "" {
+						return "--db"
+					}
+					return "$RECALL_DB_PATH"
+				}(),
+			)
+		}
+		return store.ResolveDBPath(dbPath)
+	}
+
+	if indexName != "" {
+		return store.ResolveIndexPath(indexName)
+	}
+	return store.ResolveDBPath("")
+}
+
+// openStore opens a *store.Store honouring --db / $RECALL_DB_PATH /
+// --index / default precedence. Centralised here so every subcommand
+// opens the same way.
 func openStore() (*store.Store, error) {
-	return store.Open(dbPath)
+	p, err := resolveStorePath()
+	if err != nil {
+		return nil, err
+	}
+	return store.Open(p)
 }
 
 // colorsEnabled reports whether ANSI colour codes should appear in output.
@@ -45,6 +87,7 @@ func colorsEnabled() bool {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "database path (default ~/.recall/index.db, override via $RECALL_DB_PATH)")
+	rootCmd.PersistentFlags().StringVar(&indexName, "index", "", "named index shortcut — uses ~/.recall/indexes/<name>.db; ignored when --db or $RECALL_DB_PATH is set")
 	rootCmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "disable colorized output")
 
 	rootCmd.AddCommand(collectionCmd)
@@ -61,5 +104,6 @@ func init() {
 	rootCmd.AddCommand(modelsCmd)
 	rootCmd.AddCommand(lsCmd)
 	rootCmd.AddCommand(cleanupCmd)
+	rootCmd.AddCommand(benchCmd)
 	rootCmd.AddCommand(versionCmd)
 }

@@ -123,6 +123,10 @@ func (s *Store) Close() error {
 // ResolveDBPath expands and normalises a database path. Empty input consults
 // $RECALL_DB_PATH, then falls back to DefaultDBPath. A leading "~/" is
 // expanded against the current user's home directory.
+//
+// For the --index variant see [ResolveIndexPath] — it lives alongside this
+// resolver because the commands layer chooses between them (and warns on
+// conflicts) before calling Open.
 func ResolveDBPath(explicit string) (string, error) {
 	p := explicit
 	if p == "" {
@@ -142,6 +146,50 @@ func ResolveDBPath(explicit string) (string, error) {
 		return filepath.Join(home, p[2:]), nil
 	}
 	return p, nil
+}
+
+// ResolveIndexPath maps a --index name to a concrete file path. qmd's
+// equivalent stores everything flat under ~/.cache/qmd/<name>.sqlite;
+// recall keeps the default at ~/.recall/index.db and nests named
+// indexes one level deeper at ~/.recall/indexes/<name>.db so a user
+// can't accidentally shadow the default with `--index index`.
+//
+// Name sanitisation: alphanumerics, dash, underscore. No path
+// separators, no leading dot, no "..". Reserved names ("index" is
+// fine — it lands at ~/.recall/indexes/index.db, distinct from the
+// default ~/.recall/index.db).
+func ResolveIndexPath(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("index name is empty")
+	}
+	if !validIndexName(name) {
+		return "", fmt.Errorf("invalid index name %q — use alphanumerics, dashes, and underscores only", name)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("get home dir: %w", err)
+	}
+	return filepath.Join(home, ".recall", "indexes", name+".db"), nil
+}
+
+// validIndexName returns true when name is made up of ASCII letters,
+// digits, dash, or underscore. Keeps index names portable across
+// macOS / Linux / Windows filesystems and rules out "../escape".
+func validIndexName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // migrate applies the schema. The schema is idempotent (CREATE IF NOT EXISTS)
