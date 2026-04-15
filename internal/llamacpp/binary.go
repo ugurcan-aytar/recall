@@ -206,9 +206,50 @@ func probeBinary(path string) error {
 	return nil
 }
 
+// keepFile reports whether an entry from the llama.cpp archive is
+// worth extracting. recall only ever invokes llama-server; the
+// rest of the archive (llama-cli, llama-bench, llama-perplexity,
+// llama-llava-cli, llama-tts, llama-quantize, llama-imatrix …) is
+// ~100 MB of CLIs we never touch. Filter them out on the way in
+// and cut the install footprint roughly in half.
+//
+// Rules:
+//  1. Keep llama-server (+ .exe on Windows).
+//  2. Keep every lib*.dylib / lib*.so / lib*.dll. llama-server
+//     hard-links against libllama, libggml, libggml-base, and
+//     libmtmd at build time (mtmd is bundled into the binary's
+//     @rpath even though recall never uses multimodal features);
+//     it also dlopens the libggml-cpu-* variants at runtime. A
+//     simple lib-prefix rule keeps every shared object without
+//     having to track which are linked vs dlopened per platform.
+//  3. Skip every other executable (llama-cli, llama-bench, etc.).
+//  4. Keep LICENSE (tiny, good hygiene for a redistributed binary).
+//
+// Returns true if the entry should land on disk.
+func keepFile(name string) bool {
+	base := filepath.Base(name)
+	switch base {
+	case "llama-server", "llama-server.exe":
+		return true
+	case "LICENSE":
+		return true
+	}
+	// Any shared library — llama-server links several of them by
+	// name (libllama, libggml, libmtmd on macOS) and dlopens the
+	// libggml-cpu-* variants at runtime. Filtering mtmd out caused
+	// dyld to abort on macOS; keep the whole lib*.(so|dylib|dll)
+	// set and trust the archive to ship only what llama-server
+	// needs.
+	if strings.HasPrefix(base, "lib") {
+		return true
+	}
+	return false
+}
+
 // extractTarGz unpacks a release archive into dir, flattening the
 // top-level "llama-bXXXX/" directory so users find llama-server
-// directly under BinDir.
+// directly under BinDir. Only files matching keepFile are written;
+// everything else is skipped.
 func extractTarGz(r io.Reader, dir string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
@@ -228,6 +269,9 @@ func extractTarGz(r io.Reader, dir string) error {
 		if name == "" {
 			continue
 		}
+		if !keepFile(name) && hdr.Typeflag != tar.TypeDir {
+			continue
+		}
 		out := filepath.Join(dir, name)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -240,7 +284,9 @@ func extractTarGz(r io.Reader, dir string) error {
 			}
 		case tar.TypeSymlink:
 			// llama.cpp archives ship dylib version symlinks
-			// (libllama.dylib → libllama.0.dylib). Honour them.
+			// (libllama.dylib → libllama.0.dylib). Honour them —
+			// but only if keepFile cleared the target name, which
+			// the guard above already checked.
 			_ = os.Remove(out)
 			if err := os.Symlink(hdr.Linkname, out); err != nil {
 				return fmt.Errorf("symlink %s → %s: %w", out, hdr.Linkname, err)
@@ -271,6 +317,9 @@ func extractZip(r io.Reader, dir string) error {
 	for _, f := range zr.File {
 		name := stripTopDir(f.Name)
 		if name == "" {
+			continue
+		}
+		if !f.FileInfo().IsDir() && !keepFile(name) {
 			continue
 		}
 		out := filepath.Join(dir, name)

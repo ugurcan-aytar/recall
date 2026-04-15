@@ -6,6 +6,13 @@ import (
 	"fmt"
 )
 
+// sqliteVecMaxK is the hard ceiling sqlite-vec enforces on its knn
+// MATCH parameter (`AND k = ?`). Exceeding it fails the SQL with
+// "k value in knn query too large, provided X and the limit is 4096".
+// Kept as a named constant so future bumps (sqlite-vec ≥ ?) are a
+// one-line edit.
+const sqliteVecMaxK = 4096
+
 // SearchVector runs a KNN cosine-distance query against chunk_embeddings
 // and maps winning chunks back to their documents. One row per document
 // (best chunk) with similarity = 1 / (1 + distance).
@@ -22,7 +29,15 @@ func (s *Store) SearchVector(queryVec []float32, opts SearchOptions) ([]SearchRe
 
 	limit := opts.Limit
 	if opts.All {
-		limit = 1_000_000
+		// sqlite-vec caps its knn `k` parameter at 4096 per query.
+		// --all historically set limit to 1 million which 4×-over-
+		// fetched to 4 million and blew up as
+		//   "k value in knn query too large, provided 4000000 and the limit is 4096"
+		// Cap here instead so "--all" means "as many as sqlite-vec
+		// can return in a single knn pass". Callers that genuinely
+		// need paginated full scans should switch to SearchBM25 +
+		// Get, or drive vec0 rowids directly.
+		limit = sqliteVecMaxK
 	} else if limit <= 0 {
 		limit = 5
 	}
@@ -32,11 +47,15 @@ func (s *Store) SearchVector(queryVec []float32, opts SearchOptions) ([]SearchRe
 		return nil, fmt.Errorf("serialize query vector: %w", err)
 	}
 
-	// Over-fetch: one document may own many chunks, we want a unique-doc
-	// top-N. 4× limit is a safe empirical margin.
+	// Over-fetch: one document may own many chunks, we want a
+	// unique-doc top-N. 4× limit is a safe empirical margin —
+	// but never past sqlite-vec's hard k cap.
 	knnLimit := limit * 4
 	if knnLimit < 50 {
 		knnLimit = 50
+	}
+	if knnLimit > sqliteVecMaxK {
+		knnLimit = sqliteVecMaxK
 	}
 
 	colls := splitCollections(opts.Collection)

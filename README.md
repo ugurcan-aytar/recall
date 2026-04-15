@@ -273,6 +273,21 @@ The script picks the right pre-built tarball for your OS / arch from the [latest
 
 Grab a tarball directly from the [releases page](https://github.com/ugurcan-aytar/recall/releases/latest), extract it, and drop the `recall` binary anywhere on your `$PATH`. Currently shipped: `darwin_arm64`, `linux_amd64`. SHA-256 sums in `checksums.txt`.
 
+**Linux runtime dep:** `recall embed` spawns llama.cpp's prebuilt `llama-server`, whose CPU backend plugins (`libggml-cpu-*.so`) link OpenMP. On a normal workstation you'll already have it via `gcc`/`g++`; minimal container bases (`ubuntu:24.04` without build-essential, Alpine, etc.) need it added explicitly:
+
+```bash
+# Debian/Ubuntu
+apt-get install -y libgomp1
+
+# Fedora/RHEL
+dnf install -y libgomp
+
+# Alpine
+apk add libgomp
+```
+
+Without it the llama.cpp backend loader silently falls through with "no CPU backend found" and `recall embed` times out at 60 s.
+
 ### From source
 
 For contributors and anyone on a platform without a pre-built binary:
