@@ -141,8 +141,9 @@ func (e *Engine) Embed(emb embed.Embedder, force bool) (*EmbedResult, error) {
 		}
 	}
 
+	family := emb.Family()
 	for _, ch := range chunks {
-		v, err := emb.EmbedSingle(embed.FormatDocument(ch.DocTitle, ch.Content))
+		v, err := emb.EmbedSingle(embed.FormatDocumentFor(family, ch.DocTitle, ch.Content))
 		if err != nil {
 			return nil, fmt.Errorf("embed chunk %d: %w", ch.ID, err)
 		}
@@ -190,7 +191,7 @@ func (e *Engine) SearchVector(emb embed.Embedder, query string, opts ...SearchOp
 	if emb == nil {
 		return nil, errors.New("embedder is required")
 	}
-	v, err := emb.EmbedSingle(embed.FormatQuery(query))
+	v, err := emb.EmbedSingle(embed.FormatQueryFor(emb.Family(), query))
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +225,7 @@ func (e *Engine) SearchHybrid(emb embed.Embedder, query string, opts ...SearchOp
 		return out, nil
 	}
 
-	v, err := emb.EmbedSingle(embed.FormatQuery(query))
+	v, err := emb.EmbedSingle(embed.FormatQueryFor(emb.Family(), query))
 	if err != nil {
 		return nil, err
 	}

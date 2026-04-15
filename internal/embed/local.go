@@ -30,6 +30,7 @@ type localEmbedder struct {
 	model     *llama.Model
 	ctx       *llama.Context
 	modelName string
+	family    PromptFamily
 	dims      int
 	closed    bool
 }
@@ -79,10 +80,12 @@ func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 		return nil, fmt.Errorf("probe embedding: %w", err)
 	}
 
+	name := deriveModelName(opts.ModelPath)
 	return &localEmbedder{
 		model:     model,
 		ctx:       ctx,
-		modelName: deriveModelName(opts.ModelPath),
+		modelName: name,
+		family:    ResolveFamily(name),
 		dims:      len(probe),
 	}, nil
 }
@@ -120,8 +123,9 @@ func (e *localEmbedder) EmbedSingle(text string) ([]float32, error) {
 	return v, nil
 }
 
-func (e *localEmbedder) Dimensions() int   { return e.dims }
-func (e *localEmbedder) ModelName() string { return e.modelName }
+func (e *localEmbedder) Dimensions() int       { return e.dims }
+func (e *localEmbedder) ModelName() string     { return e.modelName }
+func (e *localEmbedder) Family() PromptFamily  { return e.family }
 
 func (e *localEmbedder) Close() error {
 	e.mu.Lock()

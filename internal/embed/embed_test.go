@@ -111,3 +111,139 @@ func TestFormatQueryAndDocument(t *testing.T) {
 		t.Errorf("title-less FormatDocument: %q", dNoTitle)
 	}
 }
+
+func TestDetectFamily(t *testing.T) {
+	cases := []struct {
+		in   string
+		want PromptFamily
+	}{
+		{"nomic-embed-text-v1.5.Q8_0", FamilyNomic},
+		{"NOMIC-Embed-Text-v2", FamilyNomic},
+		{"nomic_embed_text_local", FamilyNomic},
+		{"embeddinggemma-300M-Q8_0", FamilyGemma},
+		{"embedding-gemma-300m", FamilyGemma},
+		{"google_embedding_gemma_300m", FamilyGemma},
+		{"Qwen3-Embedding-0.6B-Q8_0", FamilyQwen3},
+		{"qwen3_embedding_0.6b", FamilyQwen3},
+		{"Qwen3Embedding0.6B", FamilyQwen3},
+		{"unknown-model.Q4", FamilyNomic}, // safe fallback
+		{"", FamilyNomic},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := DetectFamily(tc.in); got != tc.want {
+				t.Errorf("DetectFamily(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveFamilyEnvOverride(t *testing.T) {
+	cases := []struct {
+		envVal, modelName string
+		want              PromptFamily
+	}{
+		{"nomic", "Qwen3-Embedding-0.6B", FamilyNomic},
+		{"gemma", "nomic-embed-text", FamilyGemma},
+		{"embeddinggemma", "nomic-embed-text", FamilyGemma},
+		{"qwen", "nomic-embed-text", FamilyQwen3},
+		{"qwen3", "nomic-embed-text", FamilyQwen3},
+		{"generic", "nomic-embed-text", FamilyGeneric},
+		{"raw", "nomic-embed-text", FamilyGeneric},
+		{"none", "nomic-embed-text", FamilyGeneric},
+		{"  Gemma  ", "nomic-embed-text", FamilyGemma}, // case + trim insensitive
+		{"", "nomic-embed-text", FamilyNomic},          // env unset → detection
+		{"unknown-format", "nomic-embed-text", FamilyNomic}, // unknown env → detection
+	}
+	for _, tc := range cases {
+		t.Run(tc.envVal+"/"+tc.modelName, func(t *testing.T) {
+			t.Setenv("RECALL_EMBED_PROMPT_FORMAT", tc.envVal)
+			if got := ResolveFamily(tc.modelName); got != tc.want {
+				t.Errorf("ResolveFamily(env=%q, model=%q) = %q, want %q",
+					tc.envVal, tc.modelName, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatQueryForPerFamily(t *testing.T) {
+	cases := []struct {
+		family PromptFamily
+		want   string
+	}{
+		{FamilyNomic, "search_query: how does X work"},
+		{FamilyGemma, "task: search result | query: how does X work"},
+		{FamilyQwen3, "Instruct: Given a query, retrieve relevant passages that answer the query\nQuery: how does X work"},
+		{FamilyGeneric, "how does X work"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.family), func(t *testing.T) {
+			if got := FormatQueryFor(tc.family, "how does X work"); got != tc.want {
+				t.Errorf("FormatQueryFor(%q) = %q, want %q", tc.family, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatDocumentForPerFamily(t *testing.T) {
+	cases := []struct {
+		family        PromptFamily
+		title, body   string
+		want          string
+	}{
+		{FamilyNomic, "Auth", "JWT details", "search_document: Auth — JWT details"},
+		{FamilyNomic, "", "JWT details", "search_document: JWT details"},
+		{FamilyGemma, "Auth", "JWT details", "title: Auth | text: JWT details"},
+		{FamilyGemma, "", "JWT details", "title: none | text: JWT details"},
+		{FamilyQwen3, "Auth", "JWT details", "JWT details"}, // qwen3 docs are raw
+		{FamilyQwen3, "", "JWT details", "JWT details"},
+		{FamilyGeneric, "Auth", "JWT details", "JWT details"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.family)+"/"+tc.title, func(t *testing.T) {
+			if got := FormatDocumentFor(tc.family, tc.title, tc.body); got != tc.want {
+				t.Errorf("FormatDocumentFor(%q, %q, %q) = %q, want %q",
+					tc.family, tc.title, tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveActiveModelPathHonoursEnv(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("RECALL_MODELS_DIR", tmp)
+
+	// Default — no override.
+	t.Setenv("RECALL_EMBED_MODEL", "")
+	got, err := ResolveActiveModelPath()
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if !strings.HasSuffix(got, DefaultModelName) {
+		t.Errorf("default = %q, want suffix %q", got, DefaultModelName)
+	}
+
+	// Bare filename — joined with ModelsDir.
+	t.Setenv("RECALL_EMBED_MODEL", "my-embed.gguf")
+	got, err = ResolveActiveModelPath()
+	if err != nil {
+		t.Fatalf("filename: %v", err)
+	}
+	if !strings.HasSuffix(got, "my-embed.gguf") {
+		t.Errorf("filename = %q, want suffix my-embed.gguf", got)
+	}
+	if !strings.Contains(got, tmp) {
+		t.Errorf("filename = %q, want to contain models dir %q", got, tmp)
+	}
+
+	// Absolute path — returned as-is.
+	abs := "/opt/models/explicit-path.gguf"
+	t.Setenv("RECALL_EMBED_MODEL", abs)
+	got, err = ResolveActiveModelPath()
+	if err != nil {
+		t.Fatalf("absolute: %v", err)
+	}
+	if got != abs {
+		t.Errorf("absolute = %q, want %q", got, abs)
+	}
+}

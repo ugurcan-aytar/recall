@@ -21,6 +21,25 @@ import (
 // quantised, 768-dim output — matches our vec0 schema directly.
 const DefaultModelName = "nomic-embed-text-v1.5.Q8_0.gguf"
 
+// ResolveActiveModelPath returns the GGUF file recall should load,
+// honouring $RECALL_EMBED_MODEL for the override. The env var may hold:
+//
+//   - a bare filename ("my-embed.gguf") — joined with [ModelsDir]
+//   - an absolute path ("/opt/models/my-embed.gguf") — used as-is
+//
+// When unset, falls back to ResolveModelPath(DefaultModelName).
+// Callers get the path only; the file may not exist yet, in which case
+// the embedder constructor will error.
+func ResolveActiveModelPath() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("RECALL_EMBED_MODEL")); v != "" {
+		if filepath.IsAbs(v) {
+			return v, nil
+		}
+		return ResolveModelPath(v)
+	}
+	return ResolveModelPath(DefaultModelName)
+}
+
 // DefaultModelURL is the canonical HuggingFace location for the bundled
 // model. Override per-call via DownloadOptions.URL when mirroring locally.
 const DefaultModelURL = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"

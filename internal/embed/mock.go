@@ -65,6 +65,14 @@ func (m *MockEmbedder) ModelName() string {
 	return m.Name
 }
 
+// Family reports FamilyGeneric so mock-backed tests exercise the
+// "no task prefix" path by default. Override by setting m.Name to a
+// string that DetectFamily recognises (e.g. "nomic-embed-mock") when
+// a test specifically needs a family's prompt format.
+func (m *MockEmbedder) Family() PromptFamily {
+	return DetectFamily(m.ModelName())
+}
+
 // Close releases the (no-op) resources.
 func (m *MockEmbedder) Close() error {
 	m.closed = true

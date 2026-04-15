@@ -83,9 +83,10 @@ func runEmbed(cmd *cobra.Command, args []string) error {
 			end = total
 		}
 		batch := chunks[i:end]
+		family := emb.Family()
 		texts := make([]string, len(batch))
 		for j, c := range batch {
-			texts[j] = embed.FormatDocument(c.DocTitle, c.Content)
+			texts[j] = embed.FormatDocumentFor(family, c.DocTitle, c.Content)
 		}
 		vecs, err := emb.Embed(texts)
 		if err != nil {

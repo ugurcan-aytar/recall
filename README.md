@@ -284,9 +284,34 @@ Run `recall doctor` any time to see which backend the current binary will use.
 | `RECALL_DB_PATH` | `~/.recall/index.db` | SQLite database location |
 | `RECALL_MODELS_DIR` | `~/.recall/models/` | GGUF model storage |
 | `RECALL_EMBED_PROVIDER` | `local` | `local` (default), `openai`, or `voyage` |
+| `RECALL_EMBED_MODEL` | `nomic-embed-text-v1.5.Q8_0.gguf` | Override the local GGUF — bare filename joined with `RECALL_MODELS_DIR`, or absolute path |
+| `RECALL_EMBED_PROMPT_FORMAT` | _detected from filename_ | Force a prompt family — `nomic`, `gemma` / `embeddinggemma`, `qwen` / `qwen3`, or `generic` / `raw` / `none` |
 | `OPENAI_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=openai` |
 | `VOYAGE_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=voyage` |
 | `NO_COLOR` | — | Set to any value to disable ANSI colors |
+
+### Bringing your own embedding model
+
+The default `nomic-embed-text-v1.5` covers most use cases, but you can
+point recall at a different GGUF without rebuilding:
+
+```sh
+# Drop a model into RECALL_MODELS_DIR (default ~/.recall/models/)
+mv ~/Downloads/embeddinggemma-300m.Q8_0.gguf ~/.recall/models/
+
+# Tell recall to use it
+export RECALL_EMBED_MODEL=embeddinggemma-300m.Q8_0.gguf
+recall embed -f          # -f drops old vectors that were embedded with nomic
+recall query "..."
+```
+
+Recall auto-detects the prompt family from the filename — `nomic-`,
+`embeddinggemma-`, and `Qwen3-Embedding-` patterns are recognised and
+get the right `task: …` / `Instruct: …` / `search_query: …` prefix
+applied. Set `RECALL_EMBED_PROMPT_FORMAT` if you have a model whose
+filename doesn't hint at its family. The model dimension must match
+recall's vec0 schema (768d); embedders that return a different width
+will fail at `recall embed` with a clear error.
 
 ## Using recall as a Go library
 

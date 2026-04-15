@@ -109,6 +109,55 @@ func TestFormatHelpersUsePublicAPI(t *testing.T) {
 	}
 }
 
+func TestFamilyHelpersUsePublicAPI(t *testing.T) {
+	if got := recall.DetectFamily("nomic-embed-text-v1.5"); got != recall.FamilyNomic {
+		t.Errorf("DetectFamily(nomic) = %q, want FamilyNomic", got)
+	}
+	if got := recall.DetectFamily("embeddinggemma-300m"); got != recall.FamilyGemma {
+		t.Errorf("DetectFamily(gemma) = %q, want FamilyGemma", got)
+	}
+	if got := recall.DetectFamily("Qwen3-Embedding-0.6B"); got != recall.FamilyQwen3 {
+		t.Errorf("DetectFamily(qwen3) = %q, want FamilyQwen3", got)
+	}
+
+	t.Setenv("RECALL_EMBED_PROMPT_FORMAT", "generic")
+	if got := recall.ResolveFamily("nomic-embed-text"); got != recall.FamilyGeneric {
+		t.Errorf("ResolveFamily(env=generic) = %q, want FamilyGeneric", got)
+	}
+
+	if got := recall.FormatQueryFor(recall.FamilyGemma, "X"); got != "task: search result | query: X" {
+		t.Errorf("FormatQueryFor(gemma) = %q", got)
+	}
+	if got := recall.FormatDocumentFor(recall.FamilyGeneric, "T", "body"); got != "body" {
+		t.Errorf("FormatDocumentFor(generic) = %q, want raw body", got)
+	}
+}
+
+func TestResolveActiveModelPathFromPublicAPI(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("RECALL_MODELS_DIR", tmp)
+
+	// Default — nothing set.
+	t.Setenv("RECALL_EMBED_MODEL", "")
+	got, err := recall.ResolveActiveModelPath()
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if got == "" {
+		t.Fatal("ResolveActiveModelPath returned empty")
+	}
+
+	// Override with a custom filename.
+	t.Setenv("RECALL_EMBED_MODEL", "my-model.gguf")
+	got, err = recall.ResolveActiveModelPath()
+	if err != nil {
+		t.Fatalf("override: %v", err)
+	}
+	if got == "" || got[len(got)-len("my-model.gguf"):] != "my-model.gguf" {
+		t.Errorf("override = %q, want suffix my-model.gguf", got)
+	}
+}
+
 func TestModelsDirAndResolveModelPath(t *testing.T) {
 	t.Setenv("RECALL_MODELS_DIR", t.TempDir())
 	dir, err := recall.ModelsDir()

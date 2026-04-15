@@ -38,23 +38,24 @@ func openEmbedder() (embed.Embedder, error) {
 	if !embed.LocalEmbedderAvailable() {
 		return nil, embed.ErrLocalEmbedderNotCompiled
 	}
-	modelPath, err := embed.ResolveModelPath(embed.DefaultModelName)
+	modelPath, err := embed.ResolveActiveModelPath()
 	if err != nil {
 		return nil, err
 	}
 	if _, err := os.Stat(modelPath); err != nil {
 		return nil, fmt.Errorf(
-			"embedding model not found at %s — run `recall models download`: %w",
+			"embedding model not found at %s — run `recall models download` or set RECALL_EMBED_MODEL: %w",
 			modelPath, err,
 		)
 	}
 	return embed.NewLocalEmbedder(embed.LocalEmbedderOptions{ModelPath: modelPath})
 }
 
-// embedQueryCached wraps EmbedSingle with the in-process LRU cache and the
-// qmd-compatible "task: search result | query: …" prompt format.
+// embedQueryCached wraps EmbedSingle with the in-process LRU cache and
+// the active embedder's family-specific query prompt format (nomic,
+// Gemma, Qwen3, or raw depending on the model).
 func embedQueryCached(e embed.Embedder, query string) ([]float32, error) {
-	prompt := embed.FormatQuery(query)
+	prompt := embed.FormatQueryFor(e.Family(), query)
 	if v, ok := queryEmbedCache.Get(prompt); ok {
 		return v, nil
 	}

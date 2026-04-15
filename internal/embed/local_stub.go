@@ -22,3 +22,10 @@ func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 // backend compiled in. Callers can branch on this to print friendlier
 // errors instead of opening a model that doesn't exist.
 func LocalEmbedderAvailable() bool { return false }
+
+// Compile-time check that MockEmbedder satisfies the Family method on
+// stub builds too — the real localEmbedder lives only when embed_llama
+// is on, so without this the interface would look incomplete to any
+// cross-module consumer that does `var _ Embedder = (*MockEmbedder)(nil)`
+// in a stub-build test.
+var _ PromptFamily = FamilyGeneric

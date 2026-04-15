@@ -27,6 +27,47 @@ type Embedder = embed.Embedder
 // means "use the local GGUF embedder".
 type APIProvider = embed.APIProvider
 
+// PromptFamily identifies an embedding model's required prompt
+// format. See [embed.PromptFamily] for the full doc.
+type PromptFamily = embed.PromptFamily
+
+// Prompt-family constants.
+const (
+	FamilyNomic   = embed.FamilyNomic
+	FamilyGemma   = embed.FamilyGemma
+	FamilyQwen3   = embed.FamilyQwen3
+	FamilyGeneric = embed.FamilyGeneric
+)
+
+// DetectFamily guesses the prompt family from a model filename.
+func DetectFamily(modelName string) PromptFamily {
+	return embed.DetectFamily(modelName)
+}
+
+// ResolveFamily honours $RECALL_EMBED_PROMPT_FORMAT first, then falls
+// back to filename-based detection.
+func ResolveFamily(modelName string) PromptFamily {
+	return embed.ResolveFamily(modelName)
+}
+
+// FormatQueryFor wraps a query in the family's task prefix so the
+// embedder receives the input it was fine-tuned on.
+func FormatQueryFor(family PromptFamily, query string) string {
+	return embed.FormatQueryFor(family, query)
+}
+
+// FormatDocumentFor wraps a chunk of document content in the family's
+// passage prefix.
+func FormatDocumentFor(family PromptFamily, title, content string) string {
+	return embed.FormatDocumentFor(family, title, content)
+}
+
+// ResolveActiveModelPath returns the GGUF file recall should load,
+// honouring $RECALL_EMBED_MODEL for the override.
+func ResolveActiveModelPath() (string, error) {
+	return embed.ResolveActiveModelPath()
+}
+
 // Provider constants — pass the right value to [APIEmbedderOptions.Provider]
 // or check the return of [ResolveAPIProvider].
 const (
@@ -171,13 +212,13 @@ func ResolveEmbedder() (Embedder, error) {
 	if !LocalEmbedderAvailable() {
 		return nil, ErrLocalEmbedderNotCompiled
 	}
-	modelPath, err := ResolveModelPath(DefaultModelName)
+	modelPath, err := ResolveActiveModelPath()
 	if err != nil {
 		return nil, err
 	}
 	if _, err := os.Stat(modelPath); err != nil {
 		return nil, fmt.Errorf(
-			"embedding model not found at %s — run `recall models download`: %w",
+			"embedding model not found at %s — run `recall models download` or set RECALL_EMBED_MODEL: %w",
 			modelPath, err,
 		)
 	}

@@ -194,6 +194,14 @@ func (a *apiEmbedder) ModelName() string {
 	return a.modelLabel
 }
 
+// Family reports FamilyGeneric: OpenAI / Voyage model cards explicitly
+// say the client should send raw query / passage text without task
+// prefixes — the API layer applies whatever prompting the model
+// needs internally.
+func (a *apiEmbedder) Family() PromptFamily {
+	return FamilyGeneric
+}
+
 func (a *apiEmbedder) Close() error {
 	a.closed = true
 	return nil
