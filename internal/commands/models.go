@@ -47,12 +47,16 @@ var (
 	modelsDownloadHash      string
 	modelsDownloadDest      string
 	modelsDownloadExpansion bool
+	modelsDownloadReranker  bool
 )
 
 var modelsDownloadCmd = &cobra.Command{
 	Use:   "download",
-	Short: "Download the default embedding model (or, with --expansion, the LLM used by --expand / --hyde)",
+	Short: "Download a recall model: embedder (default), --expansion (--expand/--hyde LLM), or --reranker (--rerank LLM)",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if modelsDownloadExpansion && modelsDownloadReranker {
+			return fmt.Errorf("--expansion and --reranker are mutually exclusive; pick one per invocation")
+		}
 		// Pick the default URL + filename based on which model the
 		// user is asking for. Explicit --url or --dest still wins.
 		defaultURL := embed.DefaultModelURL
@@ -62,6 +66,11 @@ var modelsDownloadCmd = &cobra.Command{
 			defaultURL = embed.DefaultExpansionModelURL
 			defaultName = embed.DefaultExpansionModelName
 			label = "expansion / HyDE LLM"
+		}
+		if modelsDownloadReranker {
+			defaultURL = embed.DefaultRerankerModelURL
+			defaultName = embed.DefaultRerankerModelName
+			label = "reranker LLM"
 		}
 
 		dest := modelsDownloadDest
@@ -122,6 +131,8 @@ func init() {
 	modelsDownloadCmd.Flags().StringVar(&modelsDownloadDest, "dest", "", "override destination path")
 	modelsDownloadCmd.Flags().BoolVar(&modelsDownloadExpansion, "expansion", false,
 		"download the query-expansion / HyDE LLM (qmd-query-expansion-1.7B, ~1.3 GB) instead of the embedding model")
+	modelsDownloadCmd.Flags().BoolVar(&modelsDownloadReranker, "reranker", false,
+		"download the reranker LLM (Qwen2.5-1.5B-Instruct, ~1.1 GB) used by --rerank")
 
 	modelsCmd.AddCommand(modelsListCmd, modelsDownloadCmd, modelsPathCmd)
 }

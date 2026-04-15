@@ -70,6 +70,42 @@ func ResolveActiveExpansionModelPath() (string, error) {
 	return ResolveModelPath(DefaultExpansionModelName)
 }
 
+// DefaultRerankerModelName is the GGUF generation model recall uses
+// for cross-encoder-style relevance reranking (--rerank). The model
+// is Qwen2.5-1.5B-Instruct quantised to Q4_K_M (~1.12 GB).
+//
+// Why not the qmd-query-expansion model? Empirically, fine-tuned
+// expansion models can't follow a generic "yes/no" prompt — they
+// keep emitting the lex/vec/hyde structure they were trained on.
+// A general-purpose instruct model gives clean binary answers.
+//
+// Why Qwen2.5 and not the actual Qwen3-Reranker-0.6B that qmd uses?
+// Qwen3-Reranker needs llama.cpp's `--pooling rank` mode to produce
+// real relevance scores; gollama doesn't expose that surface yet, so
+// loading the reranker as a regular generation model would yield
+// near-zero scores. Until gollama gains a rank-pooling wrapper,
+// recall falls back to a binary yes/no prompt against a small
+// instruction model.
+//
+// Override per-installation with $RECALL_RERANK_MODEL.
+const DefaultRerankerModelName = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+
+// DefaultRerankerModelURL is the canonical HuggingFace location.
+const DefaultRerankerModelURL = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+
+// ResolveActiveRerankerModelPath returns the GGUF file recall should
+// load for the reranker, honouring $RECALL_RERANK_MODEL. Bare
+// filename joins with [ModelsDir]; absolute path passes through.
+func ResolveActiveRerankerModelPath() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("RECALL_RERANK_MODEL")); v != "" {
+		if filepath.IsAbs(v) {
+			return v, nil
+		}
+		return ResolveModelPath(v)
+	}
+	return ResolveModelPath(DefaultRerankerModelName)
+}
+
 // DownloadOptions configures a model fetch.
 type DownloadOptions struct {
 	URL          string                       // download source; "" ⇒ DefaultModelURL

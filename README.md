@@ -288,6 +288,7 @@ Run `recall doctor` any time to see which backend the current binary will use.
 | `RECALL_EMBED_PROMPT_FORMAT` | _detected from filename_ | Force a prompt family — `nomic`, `gemma` / `embeddinggemma`, `qwen` / `qwen3`, or `generic` / `raw` / `none` |
 | `RECALL_EMBED_WORKERS` | `1` | Parallel embedder workers. Local backend loads N model instances (~146 MB each); API backend fires N concurrent HTTP requests. Capped at 8. |
 | `RECALL_EXPAND_MODEL` | `qmd-query-expansion-1.7B-q4_k_m.gguf` | Override the GGUF used by `--expand` and (eventually) `--hyde`. Bare filename joins with `RECALL_MODELS_DIR`; absolute path passes through. |
+| `RECALL_RERANK_MODEL` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | Override the GGUF used by `--rerank`. Same path-resolution rules as `RECALL_EXPAND_MODEL`. |
 | `OPENAI_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=openai` |
 | `VOYAGE_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=voyage` |
 | `NO_COLOR` | — | Set to any value to disable ANSI colors |
@@ -351,6 +352,43 @@ to A/B against Qwen2.5-1.5B-Instruct), drop it under
 parsing expects `lex: …` / `vec: …` / `hyde: …` lines (the qmd
 expansion-model format); a model that emits anything else won't
 crash but won't produce useful variants either.
+
+### Reranking (`--rerank`)
+
+`--rerank` sends the top-N RRF results through a small instruction-
+tuned LLM that answers a binary "does this passage answer the
+query?" question per candidate. Yes-answers float to the top, no-
+answers sink. The verdict is binary (1.0 / 0.0); fine-grained
+ordering inside each bucket is preserved by stable sort, so the
+RRF rank survives as a tiebreaker.
+
+```sh
+# One-time: download the reranker model (Qwen2.5-1.5B-Instruct,
+# Apache 2.0, ungated, ~1.1 GB).
+recall models download --reranker
+
+# Use the flag on any hybrid query.
+recall query --rerank "circuit breaker recovery timeout"
+
+# Combine with --expand for the full pipeline.
+recall query --expand --rerank "what did the team decide about authentication"
+
+# Tune how many RRF hits get reranked (default 30).
+recall query --rerank --rerank-top-n 50 "..."
+```
+
+The flag is opt-in for the same reasons as `--expand`: separate
+~1.1 GB download, and one LLM-inference call per candidate
+(measured ~70 ms per call on a modern laptop, so 30 candidates
+≈ 2 s per query). Without the flag the query path stays untouched.
+
+**A note on quality**: ideally we'd use a true cross-encoder
+(Qwen3-Reranker-0.6B with `--pooling rank`), but gollama doesn't
+expose llama.cpp's rank-pooling surface yet. Until it does, recall
+falls back to a binary-yes/no instruct prompt — empirical POC
+showed 5/5 correct discrimination on a realistic 5-doc corpus.
+When gollama gains the rank API, recall will drop in the actual
+reranker model without breaking the flag's contract.
 
 ### Speeding up `recall embed` with parallel workers
 

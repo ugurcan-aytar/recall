@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/ugurcan-aytar/recall/internal/embed"
 	"github.com/ugurcan-aytar/recall/internal/expand"
 	"github.com/ugurcan-aytar/recall/internal/llm"
+	"github.com/ugurcan-aytar/recall/internal/rerank"
 	"github.com/ugurcan-aytar/recall/internal/store"
 )
 
@@ -21,6 +23,8 @@ var (
 	queryChunkStrategy string
 	queryExpand        bool
 	queryIntent        string
+	queryRerank        bool
+	queryRerankTopN    int
 )
 
 // originalListBonus is the extra weight applied to the user's literal
@@ -155,6 +159,15 @@ var queryCmd = &cobra.Command{
 
 		fused := store.FuseRRF(bm25Results, vecResults, store.DefaultFusionOptions())
 
+		// --rerank: send the top-N RRF results through a yes/no
+		// relevance LLM (default Qwen2.5-1.5B-Instruct), then sort
+		// by rerank score. Position-aware blending lands in feature
+		// #5; for v0.2.0 the rerank score takes precedence over the
+		// RRF rank for any candidate the LLM scored.
+		if queryRerank {
+			fused = applyRerank(fused, q)
+		}
+
 		limit := queryOpts.Limit
 		if limit == 0 {
 			limit = defaultLimitForFormat(queryOpts)
@@ -280,6 +293,68 @@ func writeFusedJSON(results []store.FusedResult) error {
 	return enc.Encode(out)
 }
 
+// applyRerank dispatches the top-N RRF candidates to the reranker
+// LLM and returns a fused-result slice resorted by rerank score.
+// Falls through to the input when the reranker model isn't
+// available — same graceful-degradation contract as runExpansion.
+//
+// FusedScore is overwritten with rerank.Score for the candidates
+// that were actually scored. Untouched candidates keep their RRF
+// scores so the position-aware blender (feature #5) can fuse them
+// with rank later.
+func applyRerank(fused []store.FusedResult, q string) []store.FusedResult {
+	if len(fused) == 0 {
+		return fused
+	}
+	gen, err := openRerankGenerator()
+	if err != nil {
+		if errors.Is(err, llm.ErrLocalGeneratorNotCompiled) {
+			fmt.Fprintln(os.Stderr,
+				"warning: --rerank requires the embed_llama build; rebuild from source or drop the flag")
+			return fused
+		}
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "reranker model not found") {
+			fmt.Fprintln(os.Stderr, "warning: --rerank requested but model missing — "+err.Error())
+			return fused
+		}
+		fmt.Fprintln(os.Stderr, "warning: rerank generator open failed — "+err.Error())
+		return fused
+	}
+	defer gen.Close()
+
+	topN := queryRerankTopN
+	if topN <= 0 {
+		topN = rerank.DefaultTopN
+	}
+
+	candidates := make([]store.SearchResult, len(fused))
+	for i, f := range fused {
+		candidates[i] = f.SearchResult
+	}
+	scored, err := rerank.Rerank(context.Background(), gen, q, candidates, rerank.Options{TopN: topN})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: rerank failed — "+err.Error())
+		return fused
+	}
+
+	// rerank.Rerank returns Scored values sorted by Score desc with
+	// RRFRank as the tiebreaker. Map back to FusedResult by docKey
+	// so we keep the trace data the explain path needs.
+	traceByKey := map[string]store.FusionTrace{}
+	for _, f := range fused {
+		traceByKey[f.DocID] = f.Trace
+	}
+	out := make([]store.FusedResult, len(scored))
+	for i, s := range scored {
+		out[i] = store.FusedResult{
+			SearchResult: s.Result,
+			FusedScore:   s.Score,
+			Trace:        traceByKey[s.Result.DocID],
+		}
+	}
+	return out
+}
+
 // runExpansion drives the LLM expansion model. Errors that mean
 // "model isn't installed" are downgraded to a stderr warning and a
 // nil return so the rest of `recall query` continues with the
@@ -319,6 +394,10 @@ func init() {
 		"expand the query into LLM-generated lex + vec variants (requires `recall models download --expansion`)")
 	queryCmd.Flags().StringVar(&queryIntent, "intent", "",
 		"optional one-line intent passed to the expansion LLM (e.g. \"web performance\"); ignored without --expand")
+	queryCmd.Flags().BoolVar(&queryRerank, "rerank", false,
+		"rerank the top-N RRF results through a binary-relevance LLM (requires `recall models download --reranker`)")
+	queryCmd.Flags().IntVar(&queryRerankTopN, "rerank-top-n", 0,
+		"how many top RRF candidates to rerank (default 30); ignored without --rerank")
 
 	queryCmd.Flags().BoolVar(&queryOpts.JSON, "json", false, "JSON output")
 	queryCmd.Flags().BoolVar(&queryOpts.CSV, "csv", false, "CSV output")

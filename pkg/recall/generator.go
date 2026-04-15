@@ -67,6 +67,19 @@ func ResolveActiveExpansionModelPath() (string, error) {
 	return embed.ResolveActiveExpansionModelPath()
 }
 
+// Reranker model defaults — point at Qwen2.5-1.5B-Instruct by
+// default, override with $RECALL_RERANK_MODEL.
+const (
+	DefaultRerankerModelName = embed.DefaultRerankerModelName
+	DefaultRerankerModelURL  = embed.DefaultRerankerModelURL
+)
+
+// ResolveActiveRerankerModelPath returns the GGUF file recall should
+// load for the --rerank reranker, honouring $RECALL_RERANK_MODEL.
+func ResolveActiveRerankerModelPath() (string, error) {
+	return embed.ResolveActiveRerankerModelPath()
+}
+
 // Expanded is the parsed result of [Expand]. Lex / Vec / Hyde slices
 // hold the model's variants for each retrieval surface; Original is
 // the user's literal query.
