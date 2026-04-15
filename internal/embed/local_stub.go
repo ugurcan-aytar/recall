@@ -4,12 +4,16 @@ package embed
 
 import "fmt"
 
-// LocalEmbedderOptions is exported for API symmetry with the embed_llama
-// build. In the stub build it is unused.
+// LocalEmbedderOptions is exported for API symmetry with the
+// embed_llama build. In the stub build the only field that ever gets
+// echoed back is ModelPath (in the error message); the rest exist so
+// callers can construct an options literal without conditional code
+// per build tag.
 type LocalEmbedderOptions struct {
 	ModelPath string
 	Threads   int
 	Context   int
+	Workers   int
 }
 
 // NewLocalEmbedder is the stub default. It always returns

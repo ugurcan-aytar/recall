@@ -156,4 +156,6 @@ func init() {
 	embedCmd.Flags().BoolVarP(&embedForce, "force", "f", false, "drop existing vectors and re-embed everything")
 	embedCmd.Flags().StringVar(&embedStrategy, "chunk-strategy", "auto",
 		"chunking strategy when -f triggers a re-chunk: auto | regex | ast")
+	embedCmd.Flags().IntVar(&embedWorkersOverride, "workers", 0,
+		"parallel embedder workers (0 = single worker, default; capped at 8 for both local and API backends)")
 }

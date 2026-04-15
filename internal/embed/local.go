@@ -23,104 +23,211 @@ type LocalEmbedderOptions struct {
 	ModelPath string // absolute path to the .gguf file
 	Threads   int    // 0 ⇒ gollama default
 	Context   int    // 0 ⇒ 2048
+	Workers   int    // worker pool size; 0/1 ⇒ single shared model + mutex (current default)
 }
 
+// MaxLocalWorkers caps the number of GGUF model instances we'll load
+// in parallel. Each instance mmaps the full ~146 MB nomic file plus
+// its own context (KV cache); a hard upper bound prevents a typo'd
+// RECALL_EMBED_WORKERS=64 from OOM-ing the user's laptop.
+const MaxLocalWorkers = 8
+
+// localEmbedder owns one or more llama.Model + Context pairs and
+// dispatches Embed() across them via a buffered semaphore. With
+// Workers <= 1 it degenerates to a single model + sync.Mutex —
+// identical to the pre-parallel implementation, no extra RAM.
 type localEmbedder struct {
-	mu        sync.Mutex
-	model     *llama.Model
-	ctx       *llama.Context
+	pool      chan *workerCtx // semaphore + worker handle queue
+	all       []*workerCtx    // every owned context, for Close()
 	modelName string
 	family    PromptFamily
 	dims      int
-	closed    bool
+
+	mu     sync.Mutex
+	closed bool
 }
 
-// NewLocalEmbedder loads the GGUF model at opts.ModelPath. The first call
-// is slow (mmap + warmup); subsequent Embed calls reuse the loaded model.
+// workerCtx pairs a Model with its Context. Each worker owns one
+// pair so concurrent EmbedSingle calls don't trip gollama's
+// single-context invariants.
+type workerCtx struct {
+	model *llama.Model
+	ctx   *llama.Context
+}
+
+// NewLocalEmbedder loads opts.ModelPath. With Workers <= 1 it loads
+// a single model + context (the v0.1 default — minimum RAM, single-
+// threaded inference). With Workers > 1 it loads N independent
+// model+context pairs so Embed() can dispatch chunks concurrently
+// across them. Each extra worker costs ~146 MB (nomic Q8) + the
+// context's KV cache.
 func NewLocalEmbedder(opts LocalEmbedderOptions) (Embedder, error) {
 	if opts.ModelPath == "" {
 		return nil, errors.New("local embedder: model path is required")
 	}
 
-	model, err := llama.LoadModel(opts.ModelPath)
-	if err != nil {
-		return nil, fmt.Errorf("load gguf model %s: %w", opts.ModelPath, err)
+	workers := opts.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > MaxLocalWorkers {
+		workers = MaxLocalWorkers
 	}
 
 	ctxSize := opts.Context
 	if ctxSize <= 0 {
 		ctxSize = 2048
 	}
-	ctxOpts := []llama.ContextOption{
-		llama.WithEmbeddings(),
-		llama.WithContext(ctxSize),
-		// Force one sequence per context. gollama otherwise defaults to
-		// n_seq_max=8, splitting n_ctx (2048) across 8 sequences = 256
-		// tokens per chunk — SIGTRAPs on any chunk over ~250 tokens.
-		llama.WithParallel(1),
-		// Match batch to context so a single chunk fits one llama_batch.
-		llama.WithBatch(ctxSize),
-	}
-	if opts.Threads > 0 {
-		ctxOpts = append(ctxOpts, llama.WithThreads(opts.Threads))
+	buildContextOpts := func() []llama.ContextOption {
+		o := []llama.ContextOption{
+			llama.WithEmbeddings(),
+			llama.WithContext(ctxSize),
+			// Force one sequence per context. gollama otherwise defaults
+			// to n_seq_max=8, splitting n_ctx (2048) across 8 sequences =
+			// 256 tokens per chunk — SIGTRAPs on any chunk over ~250
+			// tokens.
+			llama.WithParallel(1),
+			// Match batch to context so a single chunk fits one
+			// llama_batch.
+			llama.WithBatch(ctxSize),
+		}
+		if opts.Threads > 0 {
+			o = append(o, llama.WithThreads(opts.Threads))
+		}
+		return o
 	}
 
-	ctx, err := model.NewContext(ctxOpts...)
-	if err != nil {
-		_ = model.Close()
-		return nil, fmt.Errorf("new context: %w", err)
-	}
-
-	// Probe dim with a one-token throwaway so callers can check Dimensions()
-	// before any user-facing embed call.
-	probe, err := ctx.GetEmbeddings("hello")
-	if err != nil {
-		_ = ctx.Close()
-		_ = model.Close()
-		return nil, fmt.Errorf("probe embedding: %w", err)
+	pool := make(chan *workerCtx, workers)
+	all := make([]*workerCtx, 0, workers)
+	var dims int
+	for i := 0; i < workers; i++ {
+		model, err := llama.LoadModel(opts.ModelPath)
+		if err != nil {
+			closeWorkers(all)
+			return nil, fmt.Errorf("load gguf model %s (worker %d): %w", opts.ModelPath, i, err)
+		}
+		ctx, err := model.NewContext(buildContextOpts()...)
+		if err != nil {
+			_ = model.Close()
+			closeWorkers(all)
+			return nil, fmt.Errorf("new context (worker %d): %w", i, err)
+		}
+		// Probe the first worker's dim. Subsequent workers must produce
+		// the same width; the model is identical so this is more of a
+		// belt-and-braces invariant than a real check.
+		probe, err := ctx.GetEmbeddings("hello")
+		if err != nil {
+			_ = ctx.Close()
+			_ = model.Close()
+			closeWorkers(all)
+			return nil, fmt.Errorf("probe embedding (worker %d): %w", i, err)
+		}
+		if i == 0 {
+			dims = len(probe)
+		} else if len(probe) != dims {
+			_ = ctx.Close()
+			_ = model.Close()
+			closeWorkers(all)
+			return nil, fmt.Errorf("worker %d returned %d-dim probe (expected %d)", i, len(probe), dims)
+		}
+		w := &workerCtx{model: model, ctx: ctx}
+		all = append(all, w)
+		pool <- w
 	}
 
 	name := deriveModelName(opts.ModelPath)
 	return &localEmbedder{
-		model:     model,
-		ctx:       ctx,
+		pool:      pool,
+		all:       all,
 		modelName: name,
 		family:    ResolveFamily(name),
-		dims:      len(probe),
+		dims:      dims,
 	}, nil
+}
+
+func closeWorkers(ws []*workerCtx) {
+	for _, w := range ws {
+		if w.ctx != nil {
+			_ = w.ctx.Close()
+		}
+		if w.model != nil {
+			_ = w.model.Close()
+		}
+	}
 }
 
 // LocalEmbedderAvailable reports whether this binary has the local backend.
 func LocalEmbedderAvailable() bool { return true }
 
+// Embed dispatches one text per worker via the pool semaphore.
+// gollama's GetEmbeddingsBatch packs all tokens into a single
+// llama_batch which a 2048-ctx BERT-class encoder overflows on the
+// first long chunk; we deliberately stay one-text-per-call and rely
+// on the worker pool for concurrency instead.
 func (e *localEmbedder) Embed(texts []string) ([][]float32, error) {
-	// gollama's GetEmbeddingsBatch packs all input tokens into a single
-	// llama_batch, which a small BERT-like embedder (nomic-embed at
-	// 2048 ctx) exceeds when given many chunks at once. One-at-a-time
-	// is plenty fast for our scale and avoids "llama_batch size
-	// exceeded" / "n_ubatch >= n_tokens" aborts.
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if e.isClosed() {
+		return nil, errors.New("local embedder is closed")
+	}
 	out := make([][]float32, len(texts))
-	for i, t := range texts {
-		v, err := e.EmbedSingle(t)
-		if err != nil {
-			return nil, err
+	if cap(e.pool) <= 1 {
+		// Single-worker fast path: no goroutines, no channel ops.
+		w := <-e.pool
+		defer func() { e.pool <- w }()
+		for i, t := range texts {
+			v, err := w.ctx.GetEmbeddings(t)
+			if err != nil {
+				return nil, fmt.Errorf("embed: %w", err)
+			}
+			out[i] = v
 		}
-		out[i] = v
+		return out, nil
+	}
+
+	errs := make(chan error, len(texts))
+	var wg sync.WaitGroup
+	wg.Add(len(texts))
+	for i, t := range texts {
+		i, t := i, t
+		go func() {
+			defer wg.Done()
+			w := <-e.pool
+			defer func() { e.pool <- w }()
+			v, err := w.ctx.GetEmbeddings(t)
+			if err != nil {
+				errs <- fmt.Errorf("embed (text %d): %w", i, err)
+				return
+			}
+			out[i] = v
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	if err := <-errs; err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 func (e *localEmbedder) EmbedSingle(text string) ([]float32, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
+	if e.isClosed() {
 		return nil, errors.New("local embedder is closed")
 	}
-	v, err := e.ctx.GetEmbeddings(text)
+	w := <-e.pool
+	defer func() { e.pool <- w }()
+	v, err := w.ctx.GetEmbeddings(text)
 	if err != nil {
 		return nil, fmt.Errorf("embed: %w", err)
 	}
 	return v, nil
+}
+
+func (e *localEmbedder) isClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closed
 }
 
 func (e *localEmbedder) Dimensions() int       { return e.dims }
@@ -134,12 +241,7 @@ func (e *localEmbedder) Close() error {
 		return nil
 	}
 	e.closed = true
-	if e.ctx != nil {
-		_ = e.ctx.Close()
-	}
-	if e.model != nil {
-		return e.model.Close()
-	}
+	closeWorkers(e.all)
 	return nil
 }
 

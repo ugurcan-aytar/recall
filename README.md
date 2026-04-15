@@ -286,6 +286,7 @@ Run `recall doctor` any time to see which backend the current binary will use.
 | `RECALL_EMBED_PROVIDER` | `local` | `local` (default), `openai`, or `voyage` |
 | `RECALL_EMBED_MODEL` | `nomic-embed-text-v1.5.Q8_0.gguf` | Override the local GGUF — bare filename joined with `RECALL_MODELS_DIR`, or absolute path |
 | `RECALL_EMBED_PROMPT_FORMAT` | _detected from filename_ | Force a prompt family — `nomic`, `gemma` / `embeddinggemma`, `qwen` / `qwen3`, or `generic` / `raw` / `none` |
+| `RECALL_EMBED_WORKERS` | `1` | Parallel embedder workers. Local backend loads N model instances (~146 MB each); API backend fires N concurrent HTTP requests. Capped at 8. |
 | `OPENAI_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=openai` |
 | `VOYAGE_API_KEY` | — | Only read when `RECALL_EMBED_PROVIDER=voyage` |
 | `NO_COLOR` | — | Set to any value to disable ANSI colors |
@@ -312,6 +313,31 @@ applied. Set `RECALL_EMBED_PROMPT_FORMAT` if you have a model whose
 filename doesn't hint at its family. The model dimension must match
 recall's vec0 schema (768d); embedders that return a different width
 will fail at `recall embed` with a clear error.
+
+### Speeding up `recall embed` with parallel workers
+
+By default `recall embed` runs one chunk through the model at a time —
+safe everywhere, no extra RAM. For larger corpora (1k+ chunks) you can
+opt into a worker pool:
+
+```sh
+# Local GGUF backend: each worker mmaps its own model instance
+# (~146 MB for nomic Q8). 4 workers ≈ 600 MB extra RAM, ~3-4× speedup
+# on a multi-core machine.
+RECALL_EMBED_WORKERS=4 recall embed
+# or per-invocation:
+recall embed --workers 4
+
+# API backend (OpenAI / Voyage): each worker fires one in-flight HTTP
+# request. Network round-trip dominates so 4-8 workers usually saturates
+# the bottleneck without tripping provider rate limits.
+RECALL_EMBED_PROVIDER=openai RECALL_EMBED_WORKERS=8 recall embed
+```
+
+Both backends cap at 8 workers internally so a typo'd
+`RECALL_EMBED_WORKERS=64` won't OOM your laptop or get you rate-limited.
+The single-worker default (`workers=0` or `1`) is identical to the v0.1
+behaviour — no goroutines, no extra model loads.
 
 ## Using recall as a Go library
 

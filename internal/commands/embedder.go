@@ -4,9 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/ugurcan-aytar/recall/internal/embed"
 )
+
+// embedWorkersOverride is set by `recall embed --workers N` so the
+// flag wins over the env var. Zero means "consult $RECALL_EMBED_WORKERS,
+// then fall back to the backend default".
+var embedWorkersOverride int
 
 // embedderOverride lets tests inject a pre-built Embedder so they don't
 // need libbinding.a. When non-nil, openEmbedder returns it instead of
@@ -32,8 +38,12 @@ func openEmbedder() (embed.Embedder, error) {
 	if embedderOverride != nil {
 		return embedderOverride, nil
 	}
+	workers := resolveWorkers()
 	if provider := embed.ResolveAPIProvider(); provider != embed.ProviderLocal {
-		return embed.NewAPIEmbedder(embed.APIEmbedderOptions{Provider: provider})
+		return embed.NewAPIEmbedder(embed.APIEmbedderOptions{
+			Provider: provider,
+			Workers:  workers,
+		})
 	}
 	if !embed.LocalEmbedderAvailable() {
 		return nil, embed.ErrLocalEmbedderNotCompiled
@@ -48,7 +58,31 @@ func openEmbedder() (embed.Embedder, error) {
 			modelPath, err,
 		)
 	}
-	return embed.NewLocalEmbedder(embed.LocalEmbedderOptions{ModelPath: modelPath})
+	return embed.NewLocalEmbedder(embed.LocalEmbedderOptions{
+		ModelPath: modelPath,
+		Workers:   workers,
+	})
+}
+
+// resolveWorkers picks the worker count, in priority order:
+//
+//   - explicit --workers flag (embedWorkersOverride > 0)
+//   - $RECALL_EMBED_WORKERS env var
+//   - 0 (backend's own default — single worker for both local and API)
+//
+// The local backend caps at MaxLocalWorkers and the API backend at
+// MaxAPIWorkers internally; this helper just returns whatever the user
+// asked for and lets the backend clamp.
+func resolveWorkers() int {
+	if embedWorkersOverride > 0 {
+		return embedWorkersOverride
+	}
+	if raw := os.Getenv("RECALL_EMBED_WORKERS"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // embedQueryCached wraps EmbedSingle with the in-process LRU cache and

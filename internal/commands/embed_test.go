@@ -31,6 +31,41 @@ func TestEmbedCmdFlags(t *testing.T) {
 	if f := embedCmd.Flags().Lookup("chunk-strategy"); f == nil {
 		t.Error("embed missing --chunk-strategy")
 	}
+	if f := embedCmd.Flags().Lookup("workers"); f == nil {
+		t.Error("embed missing --workers")
+	}
+}
+
+// TestResolveWorkersPrecedence pins the (--workers > $RECALL_EMBED_WORKERS > 0)
+// resolution order. The 0 result means "let the embedder default to its own
+// single-worker mode" — the actual default each backend picks is checked in
+// the embed package's tests.
+func TestResolveWorkersPrecedence(t *testing.T) {
+	cases := []struct {
+		name     string
+		flag     int
+		envVal   string
+		want     int
+	}{
+		{"flag wins over env", 6, "3", 6},
+		{"env used when flag is zero", 0, "5", 5},
+		{"unset env returns zero", 0, "", 0},
+		{"unparseable env returns zero", 0, "many", 0},
+		{"negative env returns zero", 0, "-3", 0},
+		{"zero env returns zero", 0, "0", 0},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("RECALL_EMBED_WORKERS", tc.envVal)
+			prev := embedWorkersOverride
+			embedWorkersOverride = tc.flag
+			t.Cleanup(func() { embedWorkersOverride = prev })
+			if got := resolveWorkers(); got != tc.want {
+				t.Errorf("resolveWorkers() = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestReconcileModelNameNoChange(t *testing.T) {

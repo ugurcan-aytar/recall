@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,8 +55,17 @@ type APIEmbedderOptions struct {
 	BaseURL    string      // "" ⇒ provider default; useful for tests / proxies
 	Dimensions int         // OpenAI only: passes `dimensions` to truncate; 0 ⇒ store.EmbeddingDimensions
 	BatchSize  int         // 0 ⇒ APIBatchSize
+	Workers    int         // max in-flight HTTP requests per Embed call; 0/1 ⇒ sequential
 	HTTPClient *http.Client
 }
+
+// MaxAPIWorkers is the upper bound recall enforces on per-Embed HTTP
+// concurrency. Both OpenAI and Voyage publish per-key rate limits in
+// the low double-digits per second; firing 16+ requests in parallel
+// from one process trips them quickly. Capping at 8 keeps us safely
+// inside the published budgets while still amortising round-trip
+// latency across batches.
+const MaxAPIWorkers = 8
 
 // apiEmbedder implements [Embedder] over an HTTP API.
 type apiEmbedder struct {
@@ -163,17 +173,75 @@ func (a *apiEmbedder) Embed(texts []string) ([][]float32, error) {
 	if a.closed {
 		return nil, errors.New("api embedder is closed")
 	}
-	out := make([][]float32, 0, len(texts))
+	if len(texts) == 0 {
+		return nil, nil
+	}
+
+	// Slice into APIBatchSize-sized batches up-front so the worker
+	// dispatch loop just walks a slice of indices.
+	type batchSpec struct {
+		start, end int
+	}
+	var batches []batchSpec
 	for i := 0; i < len(texts); i += a.opts.BatchSize {
 		end := i + a.opts.BatchSize
 		if end > len(texts) {
 			end = len(texts)
 		}
-		vecs, err := a.embedBatch(texts[i:end])
-		if err != nil {
-			return nil, fmt.Errorf("batch %d..%d: %w", i, end, err)
+		batches = append(batches, batchSpec{start: i, end: end})
+	}
+
+	out := make([][]float32, len(texts))
+
+	workers := a.opts.Workers
+	if workers <= 1 || len(batches) == 1 {
+		// Single-worker path: sequential, no goroutine overhead, exact
+		// pre-1.0 behaviour.
+		for _, b := range batches {
+			vecs, err := a.embedBatch(texts[b.start:b.end])
+			if err != nil {
+				return nil, fmt.Errorf("batch %d..%d: %w", b.start, b.end, err)
+			}
+			copy(out[b.start:b.end], vecs)
 		}
-		out = append(out, vecs...)
+		return out, nil
+	}
+	if workers > MaxAPIWorkers {
+		workers = MaxAPIWorkers
+	}
+	if workers > len(batches) {
+		workers = len(batches)
+	}
+
+	// Bounded fan-out: a buffered channel hands batch specs to workers
+	// who write directly into their own slice of out. First error
+	// short-circuits the rest.
+	jobs := make(chan batchSpec, len(batches))
+	for _, b := range batches {
+		jobs <- b
+	}
+	close(jobs)
+
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for b := range jobs {
+				vecs, err := a.embedBatch(texts[b.start:b.end])
+				if err != nil {
+					errs <- fmt.Errorf("batch %d..%d: %w", b.start, b.end, err)
+					return
+				}
+				copy(out[b.start:b.end], vecs)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	if err := <-errs; err != nil {
+		return nil, err
 	}
 	return out, nil
 }

@@ -142,13 +142,29 @@ func (e *Engine) Embed(emb embed.Embedder, force bool) (*EmbedResult, error) {
 	}
 
 	family := emb.Family()
-	for _, ch := range chunks {
-		v, err := emb.EmbedSingle(embed.FormatDocumentFor(family, ch.DocTitle, ch.Content))
-		if err != nil {
-			return nil, fmt.Errorf("embed chunk %d: %w", ch.ID, err)
+	const batchSize = 32 // matches commands/embed.go's orchestrator batch
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
 		}
-		if err := e.store.UpsertEmbedding(ch.ID, v); err != nil {
-			return nil, err
+		batch := chunks[i:end]
+		texts := make([]string, len(batch))
+		for j, ch := range batch {
+			texts[j] = embed.FormatDocumentFor(family, ch.DocTitle, ch.Content)
+		}
+		// Backend-internal worker pool (when configured) parallelises
+		// here. The orchestrator stays sequential at the batch
+		// boundary so write-back to SQLite is one transaction's worth
+		// at a time.
+		vecs, err := emb.Embed(texts)
+		if err != nil {
+			return nil, fmt.Errorf("embed chunks %d..%d: %w", i, end, err)
+		}
+		for j, v := range vecs {
+			if err := e.store.UpsertEmbedding(batch[j].ID, v); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := e.store.SetMetadata("embedding_model", emb.ModelName()); err != nil {

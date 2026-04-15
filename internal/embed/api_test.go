@@ -167,6 +167,206 @@ func TestAPIEmbedderVoyageRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAPIEmbedderWorkerCapClamps verifies the embedder respects
+// MaxAPIWorkers — passing Workers=64 doesn't fan out to 64
+// concurrent requests against a real provider.
+func TestAPIEmbedderWorkerCapClamps(t *testing.T) {
+	var (
+		concurrent int32
+		peak       int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Track in-flight count across the request's lifetime so the
+		// peak we observe = max parallelism the embedder achieved.
+		now := atomic.AddInt32(&concurrent, 1)
+		for {
+			cur := atomic.LoadInt32(&peak)
+			if now <= cur || atomic.CompareAndSwapInt32(&peak, cur, now) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond) // give the next worker a chance to overlap
+		atomic.AddInt32(&concurrent, -1)
+
+		var req embedRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		out := make([]embedResponseItem, len(req.Input))
+		for i := range out {
+			out[i] = embedResponseItem{Embedding: make([]float32, 768), Index: i}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer srv.Close()
+
+	e, _ := NewAPIEmbedder(APIEmbedderOptions{
+		Provider:  ProviderOpenAI,
+		APIKey:    "x",
+		BaseURL:   srv.URL,
+		BatchSize: 1,  // 1 text per HTTP call ⇒ N batches for N texts
+		Workers:   64, // intentionally above MaxAPIWorkers (8)
+	})
+	texts := make([]string, 32) // 32 batches with batchSize=1
+	for i := range texts {
+		texts[i] = "t"
+	}
+	if _, err := e.Embed(texts); err != nil {
+		t.Fatal(err)
+	}
+	got := atomic.LoadInt32(&peak)
+	if got > int32(MaxAPIWorkers) {
+		t.Errorf("peak concurrent requests = %d, expected ≤ MaxAPIWorkers (%d)", got, MaxAPIWorkers)
+	}
+	if got < 2 {
+		t.Errorf("peak concurrent requests = %d, expected ≥ 2 (parallelism didn't kick in)", got)
+	}
+}
+
+// TestAPIEmbedderParallelDispatchesConcurrently verifies that
+// Workers > 1 actually fires concurrent HTTP requests.
+func TestAPIEmbedderParallelDispatchesConcurrently(t *testing.T) {
+	var (
+		concurrent int32
+		peak       int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := atomic.AddInt32(&concurrent, 1)
+		for {
+			cur := atomic.LoadInt32(&peak)
+			if now <= cur || atomic.CompareAndSwapInt32(&peak, cur, now) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&concurrent, -1)
+
+		var req embedRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		out := make([]embedResponseItem, len(req.Input))
+		for i := range out {
+			out[i] = embedResponseItem{Embedding: make([]float32, 768), Index: i}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer srv.Close()
+
+	e, _ := NewAPIEmbedder(APIEmbedderOptions{
+		Provider:  ProviderOpenAI,
+		APIKey:    "x",
+		BaseURL:   srv.URL,
+		BatchSize: 1,
+		Workers:   4,
+	})
+	texts := make([]string, 12) // 12 batches at batchSize=1
+	for i := range texts {
+		texts[i] = "t"
+	}
+	if _, err := e.Embed(texts); err != nil {
+		t.Fatal(err)
+	}
+	got := atomic.LoadInt32(&peak)
+	if got < 2 {
+		t.Errorf("peak concurrent = %d, expected ≥ 2", got)
+	}
+	if got > 4 {
+		t.Errorf("peak concurrent = %d, expected ≤ Workers (4)", got)
+	}
+}
+
+// TestAPIEmbedderSingleWorkerIsSequential verifies the default
+// Workers=0/1 path stays sequential (one HTTP call at a time).
+func TestAPIEmbedderSingleWorkerIsSequential(t *testing.T) {
+	var (
+		concurrent int32
+		peak       int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := atomic.AddInt32(&concurrent, 1)
+		for {
+			cur := atomic.LoadInt32(&peak)
+			if now <= cur || atomic.CompareAndSwapInt32(&peak, cur, now) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		atomic.AddInt32(&concurrent, -1)
+
+		var req embedRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		out := make([]embedResponseItem, len(req.Input))
+		for i := range out {
+			out[i] = embedResponseItem{Embedding: make([]float32, 768), Index: i}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer srv.Close()
+
+	e, _ := NewAPIEmbedder(APIEmbedderOptions{
+		Provider:  ProviderOpenAI,
+		APIKey:    "x",
+		BaseURL:   srv.URL,
+		BatchSize: 1,
+		// Workers omitted ⇒ 0 ⇒ sequential.
+	})
+	texts := make([]string, 6)
+	for i := range texts {
+		texts[i] = "t"
+	}
+	if _, err := e.Embed(texts); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&peak); got != 1 {
+		t.Errorf("peak concurrent = %d, expected 1 (sequential path)", got)
+	}
+}
+
+// TestAPIEmbedderParallelPreservesOrder verifies that parallel
+// dispatch still returns vectors in input order (the index field of
+// each embedResponseItem matters here too).
+func TestAPIEmbedderParallelPreservesOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req embedRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		out := make([]embedResponseItem, len(req.Input))
+		for i, in := range req.Input {
+			// Encode the input string into the first vector
+			// component so we can recover ordering on the client.
+			vec := make([]float32, 768)
+			vec[0] = float32(int(in[0])) // input is "0", "1", etc.
+			out[i] = embedResponseItem{Embedding: vec, Index: i}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+	}))
+	defer srv.Close()
+
+	e, _ := NewAPIEmbedder(APIEmbedderOptions{
+		Provider:  ProviderOpenAI,
+		APIKey:    "x",
+		BaseURL:   srv.URL,
+		BatchSize: 1,
+		Workers:   4,
+	})
+	texts := make([]string, 16)
+	for i := range texts {
+		// Single-char inputs '0'..'?' so we can recover order from the
+		// first vector component.
+		texts[i] = string(rune('0' + i))
+	}
+	vecs, err := e.Embed(texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range vecs {
+		want := float32('0' + i)
+		if v[0] != want {
+			t.Errorf("vec[%d][0] = %v, want %v (parallel dispatch reordered results)", i, v[0], want)
+		}
+	}
+}
+
 func TestAPIEmbedderBatchSplitting(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
