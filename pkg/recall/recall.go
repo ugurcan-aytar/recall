@@ -24,6 +24,16 @@ import (
 	"github.com/ugurcan-aytar/recall/internal/store"
 )
 
+// SearchResult is one document's worth of search output. Aliased
+// to [store.SearchResult] so external consumers can pass return
+// values from Engine.SearchBM25 / SearchVector straight into
+// [Rerank] without the internal import.
+type SearchResult = store.SearchResult
+
+// FusedResult is the RRF-fused hybrid-search output. Aliased to
+// [store.FusedResult]; embeds SearchResult.
+type FusedResult = store.FusedResult
+
 // Engine is recall's high-level handle. Wraps a *store.Store and (when
 // supplied) an Embedder. Safe for concurrent use.
 type Engine struct {

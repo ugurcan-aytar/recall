@@ -7,6 +7,8 @@ package recall
 // file is purely the exported facade.
 
 import (
+	"context"
+
 	"github.com/ugurcan-aytar/recall/internal/embed"
 	"github.com/ugurcan-aytar/recall/internal/expand"
 	"github.com/ugurcan-aytar/recall/internal/llm"
@@ -105,4 +107,49 @@ type ExpandOptions = expand.Options
 // structured response. See [expand.Expand] for the full doc.
 func Expand(gen Generator, query string, opts ExpandOptions) (*Expanded, error) {
 	return expand.Expand(gen, query, opts)
+}
+
+// Reranker is the cross-encoder reranking contract — see
+// [llm.Reranker]. brain and other library consumers construct one
+// via [NewLocalReranker] and hand it to [Rerank].
+type Reranker = llm.Reranker
+
+// LocalRerankerOptions configures [NewLocalReranker].
+type LocalRerankerOptions = llm.LocalRerankerOptions
+
+// NewLocalReranker boots a llama-server subprocess in `--reranking`
+// mode against the GGUF at opts.ModelPath. Returns a Reranker that
+// talks to `/v1/rerank` under the hood.
+func NewLocalReranker(opts LocalRerankerOptions) (Reranker, error) {
+	return llm.NewLocalReranker(opts)
+}
+
+// LocalRerankerAvailable reports whether this binary can spawn a
+// local reranker. Always true on v0.2.4+ (subprocess pattern).
+func LocalRerankerAvailable() bool { return llm.LocalRerankerAvailable() }
+
+// ErrLocalRerankerNotAvailable signals that the reranker can't come
+// up (model file missing, llama.cpp binary fetch failed, server
+// boot failed). Callers that want graceful fallback should check
+// errors.Is against this sentinel.
+var ErrLocalRerankerNotAvailable = llm.ErrLocalRerankerNotAvailable
+
+// Scored pairs a retrieved candidate with its reranker relevance
+// score. See [rerank.Scored] for field semantics.
+type Scored = rerank.Scored
+
+// RerankOptions tweaks one [Rerank] call.
+type RerankOptions = rerank.Options
+
+// Rerank scores each candidate against the query with a cross-
+// encoder reranker and returns the slice sorted by normalised
+// score desc. See [rerank.Rerank] for the full doc.
+func Rerank(ctx context.Context, rr Reranker, query string, candidates []SearchResult, opts RerankOptions) ([]Scored, error) {
+	return rerank.Rerank(ctx, rr, query, candidates, opts)
+}
+
+// PositionAwareBlend fuses RRF rank with reranker score using
+// per-rank-band weights. See [rerank.PositionAwareBlend].
+func PositionAwareBlend(scored []Scored, bands BlendBands) []Scored {
+	return rerank.PositionAwareBlend(scored, bands)
 }
