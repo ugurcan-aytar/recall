@@ -339,21 +339,20 @@ func applyRerank(fused []store.FusedResult, q string) []store.FusedResult {
 	if len(fused) == 0 {
 		return fused
 	}
-	gen, err := openRerankGenerator()
+	rr, err := openReranker()
 	if err != nil {
-		if errors.Is(err, llm.ErrLocalGeneratorNotCompiled) {
-			fmt.Fprintln(os.Stderr,
-				"warning: --rerank requires the embed_llama build; rebuild from source or drop the flag")
+		if errors.Is(err, llm.ErrLocalRerankerNotAvailable) {
+			fmt.Fprintln(os.Stderr, "warning: --rerank requested but reranker unavailable — "+err.Error())
 			return fused
 		}
 		if os.IsNotExist(err) || strings.Contains(err.Error(), "reranker model not found") {
 			fmt.Fprintln(os.Stderr, "warning: --rerank requested but model missing — "+err.Error())
 			return fused
 		}
-		fmt.Fprintln(os.Stderr, "warning: rerank generator open failed — "+err.Error())
+		fmt.Fprintln(os.Stderr, "warning: rerank open failed — "+err.Error())
 		return fused
 	}
-	defer gen.Close()
+	defer rr.Close()
 
 	topN := queryRerankTopN
 	if topN <= 0 {
@@ -364,7 +363,7 @@ func applyRerank(fused []store.FusedResult, q string) []store.FusedResult {
 	for i, f := range fused {
 		candidates[i] = f.SearchResult
 	}
-	scored, err := rerank.Rerank(context.Background(), gen, q, candidates, rerank.Options{TopN: topN})
+	scored, err := rerank.Rerank(context.Background(), rr, q, candidates, rerank.Options{TopN: topN})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning: rerank failed — "+err.Error())
 		return fused

@@ -70,28 +70,34 @@ func ResolveActiveExpansionModelPath() (string, error) {
 	return ResolveModelPath(DefaultExpansionModelName)
 }
 
-// DefaultRerankerModelName is the GGUF generation model recall uses
-// for cross-encoder-style relevance reranking (--rerank). The model
-// is Qwen2.5-1.5B-Instruct quantised to Q4_K_M (~1.12 GB).
+// DefaultRerankerModelName is the cross-encoder reranker recall
+// loads for --rerank. v0.2.4 switched from a Qwen2.5-1.5B-Instruct
+// binary-yes/no fallback (documented below) to BAAI's
+// bge-reranker-v2-m3 at Q4_K_M (~418 MB). bge-reranker-v2-m3 is
+// explicitly supported by llama.cpp's reranking path (PR #9510
+// added rerank to libllama / llama-server / llama-embedding using
+// this model as the reference), Apache 2.0, multilingual (568 M
+// params, bge-m3 base), and published in GGUF by multiple
+// reputable uploaders. It returns continuous relevance logits
+// (roughly [-12, +8] in practice) via llama-server's /v1/rerank
+// endpoint — real gradient signal, not the binary-yes/no echo we
+// were stuck with.
 //
-// Why not the qmd-query-expansion model? Empirically, fine-tuned
-// expansion models can't follow a generic "yes/no" prompt — they
-// keep emitting the lex/vec/hyde structure they were trained on.
-// A general-purpose instruct model gives clean binary answers.
-//
-// Why Qwen2.5 and not the actual Qwen3-Reranker-0.6B that qmd uses?
-// Qwen3-Reranker needs llama.cpp's `--pooling rank` mode to produce
-// real relevance scores; gollama doesn't expose that surface yet, so
-// loading the reranker as a regular generation model would yield
-// near-zero scores. Until gollama gains a rank-pooling wrapper,
-// recall falls back to a binary yes/no prompt against a small
-// instruction model.
+// History: pre-v0.2.4 recall used Qwen2.5-1.5B-Instruct with a
+// binary-yes/no prompt, because the reranker had to go through the
+// same /v1/chat/completions surface the expansion path used — the
+// old backend (dianlight/gollama.cpp → godeps/gollama before that)
+// didn't expose llama.cpp's rank-pooling surface. v0.2.2's
+// subprocess pattern means we now talk to llama-server directly;
+// llama-server's `--reranking` flag + `/v1/rerank` endpoint turn
+// out to have shipped long ago — the "not yet supported" comment
+// in previous recall versions was just wrong.
 //
 // Override per-installation with $RECALL_RERANK_MODEL.
-const DefaultRerankerModelName = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+const DefaultRerankerModelName = "bge-reranker-v2-m3-Q4_K_M.gguf"
 
 // DefaultRerankerModelURL is the canonical HuggingFace location.
-const DefaultRerankerModelURL = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+const DefaultRerankerModelURL = "https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q4_K_M.gguf"
 
 // ResolveActiveRerankerModelPath returns the GGUF file recall should
 // load for the reranker, honouring $RECALL_RERANK_MODEL. Bare

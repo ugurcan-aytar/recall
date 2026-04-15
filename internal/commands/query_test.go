@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,9 +85,9 @@ func TestRunExpansionWithoutModelDegrades(t *testing.T) {
 // half, the blend's "RRF protects top + reranker corrects deep"
 // shape collapses to: yes-and-top-RRF wins, no-and-tail-RRF loses.
 func TestApplyRerankReordersByBlendedScore(t *testing.T) {
-	gen := &keywordYesNoGen{}
-	SetRerankGeneratorOverride(gen)
-	t.Cleanup(func() { SetRerankGeneratorOverride(nil) })
+	rr := &keywordReranker{}
+	SetRerankerOverride(rr)
+	t.Cleanup(func() { SetRerankerOverride(nil) })
 
 	// Top 3 RRF positions are "match" (yes), bottom 3 are not (no).
 	in := []store.FusedResult{
@@ -141,10 +142,10 @@ func TestApplyRerankReordersByBlendedScore(t *testing.T) {
 // degradation: no model, no override → applyRerank returns the
 // input unchanged so the user still gets RRF-ordered results.
 func TestApplyRerankWithoutModelLeavesInputAlone(t *testing.T) {
-	if llm.LocalGeneratorAvailable() {
-		t.Skip("binary built with embed_llama — degradation path not reachable")
+	if llm.LocalRerankerAvailable() {
+		t.Skip("binary has local reranker available — degradation path not reachable without a missing model file")
 	}
-	SetRerankGeneratorOverride(nil)
+	SetRerankerOverride(nil)
 	in := []store.FusedResult{
 		{SearchResult: store.SearchResult{DocID: "a"}, FusedScore: 0.9},
 		{SearchResult: store.SearchResult{DocID: "b"}, FusedScore: 0.5},
@@ -158,14 +159,26 @@ func TestApplyRerankWithoutModelLeavesInputAlone(t *testing.T) {
 	}
 }
 
-type keywordYesNoGen struct{ llm.MockGenerator }
+// keywordReranker stands in for llm.Reranker in the applyRerank test.
+// Each passage containing "match" scores high; everything else scores
+// low. Min-max normalisation inside rerank.Rerank then maps those
+// logits onto [0,1] so the blender sees the canonical "top-3 are yes"
+// shape the test expects.
+type keywordReranker struct{}
 
-func (k *keywordYesNoGen) Generate(prompt string, _ ...llm.GenerateOption) (string, error) {
-	if strings.Contains(strings.ToLower(prompt), "match") {
-		return "yes", nil
+func (k *keywordReranker) Rerank(_ context.Context, _ string, docs []string) ([]float64, error) {
+	out := make([]float64, len(docs))
+	for i, d := range docs {
+		if strings.Contains(strings.ToLower(d), "match") {
+			out[i] = 5.0
+		} else {
+			out[i] = -5.0
+		}
 	}
-	return "no", nil
+	return out, nil
 }
+func (k *keywordReranker) ModelName() string { return "keyword-reranker" }
+func (k *keywordReranker) Close() error      { return nil }
 
 // recordingGen captures every prompt it sees so collection-context
 // auto-intent can be asserted on directly.

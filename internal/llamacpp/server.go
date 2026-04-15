@@ -34,16 +34,17 @@ import (
 
 // ServerOptions configures a llama-server boot.
 type ServerOptions struct {
-	ModelPath   string // .gguf path; required
-	Embedding   bool   // pass --embedding (lock the server to embedding-only)
-	Pooling     string // "mean" | "cls" | "last" | "rank"; "" = model default
-	Context     int    // n_ctx; 0 = let llama.cpp choose from model
-	BatchSize   int    // -b; 0 = llama.cpp default
-	UBatchSize  int    // -ub; 0 = llama.cpp default
-	Parallel    int    // -np; 0 = let llama.cpp pick
-	Threads     int    // -t; 0 = llama.cpp default
-	GPULayers   int    // -ngl; -1 = unset; 0 = force CPU
-	StderrSink  io.Writer // optional log destination, defaults to os.Stderr
+	ModelPath  string    // .gguf path; required
+	Embedding  bool      // pass --embedding (lock the server to embedding-only)
+	Reranking  bool      // pass --reranking (enable /v1/rerank endpoint)
+	Pooling    string    // "mean" | "cls" | "last" | "rank"; "" = model default
+	Context    int       // n_ctx; 0 = let llama.cpp choose from model
+	BatchSize  int       // -b; 0 = llama.cpp default
+	UBatchSize int       // -ub; 0 = llama.cpp default
+	Parallel   int       // -np; 0 = let llama.cpp pick
+	Threads    int       // -t; 0 = llama.cpp default
+	GPULayers  int       // -ngl; -1 = unset; 0 = force CPU
+	StderrSink io.Writer // optional log destination, defaults to os.Stderr
 }
 
 // Server is a running llama-server bound to a Unix socket.
@@ -96,6 +97,9 @@ func StartServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 	}
 	if opts.Embedding {
 		args = append(args, "--embedding")
+	}
+	if opts.Reranking {
+		args = append(args, "--reranking")
 	}
 	if opts.Pooling != "" {
 		args = append(args, "--pooling", opts.Pooling)

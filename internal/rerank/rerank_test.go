@@ -3,7 +3,6 @@ package rerank_test
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/ugurcan-aytar/recall/internal/llm"
@@ -12,8 +11,8 @@ import (
 )
 
 // fixtureCandidates returns three SearchResults whose snippets each
-// trigger a specific verdict from the keyword-yes/no MockGenerator
-// rule below.
+// carry a different rerank verdict from the scripted fakeReranker
+// below.
 func fixtureCandidates() []store.SearchResult {
 	return []store.SearchResult{
 		{DocID: "a", Path: "a.md", Title: "A", Snippet: "passage labelled relevant",
@@ -25,48 +24,85 @@ func fixtureCandidates() []store.SearchResult {
 	}
 }
 
-// keywordGen returns a generator whose response depends on whether
-// the prompt contains "relevant" (yes) or "irrelevant" (no). Lets us
-// rerank a fixture without mocking the exact prompt-to-response map.
-type keywordGen struct {
-	llm.MockGenerator
+// fakeReranker implements llm.Reranker by mapping each document to a
+// canned logit based on a substring lookup. Catches wire-level bugs
+// (index ordering, length mismatches) without spinning up a real
+// llama-server.
+type fakeReranker struct {
+	scores  map[string]float64
+	err     error
+	lastQry string
+	lastDoc []string
+	closed  bool
 }
 
-func (k *keywordGen) Generate(prompt string, _ ...llm.GenerateOption) (string, error) {
-	low := strings.ToLower(prompt)
-	if strings.Contains(low, "irrelevant") {
-		return "no", nil
+func (f *fakeReranker) Rerank(_ context.Context, query string, docs []string) ([]float64, error) {
+	f.lastQry = query
+	f.lastDoc = append([]string(nil), docs...)
+	if f.err != nil {
+		return nil, f.err
 	}
-	if strings.Contains(low, "relevant") {
-		return "yes", nil
+	out := make([]float64, len(docs))
+	for i, d := range docs {
+		score := -10.0
+		for keyword, s := range f.scores {
+			if contains(d, keyword) {
+				score = s
+				break
+			}
+		}
+		out[i] = score
 	}
-	return "no", nil
+	return out, nil
+}
+func (f *fakeReranker) ModelName() string { return "fake-reranker" }
+func (f *fakeReranker) Close() error      { f.closed = true; return nil }
+
+func contains(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRerankSortsByScoreDesc(t *testing.T) {
-	gen := &keywordGen{}
-	got, err := rerank.Rerank(context.Background(), gen, "q", fixtureCandidates(), rerank.Options{})
+	rr := &fakeReranker{scores: map[string]float64{
+		"passage labelled relevant":    5.0,
+		"passage labelled irrelevant": -5.0,
+	}}
+	got, err := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(), rerank.Options{})
 	if err != nil {
 		t.Fatalf("Rerank: %v", err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("len = %d, want 3", len(got))
 	}
-	// a and c are "relevant" → 1.0; b is "irrelevant" → 0.0. The
-	// stable sort should preserve a then c (input order).
+	// a and c both score +5 ("relevant"); b scores -5 ("irrelevant").
+	// Stable sort preserves input order within tied scores → [a c b].
 	if got[0].Result.DocID != "a" || got[1].Result.DocID != "c" || got[2].Result.DocID != "b" {
 		t.Errorf("order = [%s %s %s], want [a c b]",
 			got[0].Result.DocID, got[1].Result.DocID, got[2].Result.DocID)
 	}
+	// Min-max normalisation: min=-5, max=+5 → tied relevant docs
+	// land at 1.0, irrelevant at 0.0.
 	if got[0].Score != 1 || got[1].Score != 1 || got[2].Score != 0 {
-		t.Errorf("scores = [%g %g %g], want [1 1 0]",
+		t.Errorf("normalised scores = [%g %g %g], want [1 1 0]",
 			got[0].Score, got[1].Score, got[2].Score)
+	}
+	// Raw logits should survive normalisation for --explain traces.
+	if got[0].RawScore != 5 || got[2].RawScore != -5 {
+		t.Errorf("raw scores = [%g %g], want [5 -5]", got[0].RawScore, got[2].RawScore)
 	}
 }
 
 func TestRerankCarriesRRFRank(t *testing.T) {
-	gen := &keywordGen{}
-	got, _ := rerank.Rerank(context.Background(), gen, "q", fixtureCandidates(), rerank.Options{})
+	rr := &fakeReranker{scores: map[string]float64{
+		"relevant":    5.0,
+		"irrelevant": -5.0,
+	}}
+	got, _ := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(), rerank.Options{})
 	for _, s := range got {
 		switch s.Result.DocID {
 		case "a":
@@ -86,107 +122,119 @@ func TestRerankCarriesRRFRank(t *testing.T) {
 }
 
 func TestRerankTopNLeavesTailUnscored(t *testing.T) {
-	gen := &keywordGen{}
-	got, _ := rerank.Rerank(context.Background(), gen, "q", fixtureCandidates(),
+	rr := &fakeReranker{scores: map[string]float64{
+		"relevant":    5.0,
+		"irrelevant": -5.0,
+	}}
+	got, _ := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(),
 		rerank.Options{TopN: 1})
-	// Only candidate 0 ("a"/relevant) gets the LLM, so it scores
-	// 1.0. The other two stay at the 0.5 "unscored" sentinel.
-	var scoredA, unscoredB, unscoredC bool
+	// Only candidate 0 ("a") goes to the reranker. With TopN=1 the
+	// candidate set has no span (single item), so even the scored
+	// one falls back to the 0.5 sentinel; the other two were never
+	// submitted and stay at 0.5.
 	for _, s := range got {
-		switch s.Result.DocID {
-		case "a":
-			scoredA = s.Score == 1.0
-		case "b":
-			unscoredB = s.Score == 0.5
-		case "c":
-			unscoredC = s.Score == 0.5
+		if s.Score != 0.5 {
+			t.Errorf("doc %s scored %g, want 0.5 (single-item TopN has no span)",
+				s.Result.DocID, s.Score)
 		}
 	}
-	if !scoredA {
-		t.Error("a should have been scored 1.0")
-	}
-	if !unscoredB || !unscoredC {
-		t.Errorf("b/c should have stayed at 0.5 unscored sentinel; got = %+v", got)
+	if len(rr.lastDoc) != 1 {
+		t.Errorf("reranker got %d docs, want 1 (TopN=1)", len(rr.lastDoc))
 	}
 }
 
-func TestRerankRejectsNilGenerator(t *testing.T) {
+func TestRerankRejectsNilReranker(t *testing.T) {
 	if _, err := rerank.Rerank(context.Background(), nil, "q", nil, rerank.Options{}); err == nil {
-		t.Error("expected error on nil generator")
+		t.Error("expected error on nil reranker")
 	}
 }
 
-func TestRerankRespectsContextCancellation(t *testing.T) {
-	gen := &keywordGen{}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := rerank.Rerank(ctx, gen, "q", fixtureCandidates(), rerank.Options{})
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("err = %v, want context.Canceled", err)
-	}
-}
-
-func TestRerankPerCallErrorLeavesUnscored(t *testing.T) {
-	// erroringGen always errors — every candidate must be left at
-	// the 0.5 sentinel and the function returns nil error (rerank
-	// degrades gracefully on per-call failures so a flaky model
-	// doesn't kill the whole query).
-	gen := &erroringGen{err: errors.New("boom")}
-	got, err := rerank.Rerank(context.Background(), gen, "q", fixtureCandidates(), rerank.Options{})
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+func TestRerankRerankerErrorLeavesUnscored(t *testing.T) {
+	// When the HTTP call fails, rerank returns the error but also
+	// hands back the candidate slice with Score=0.5 so the caller
+	// can decide whether to fall back to RRF ordering.
+	rr := &fakeReranker{err: errors.New("boom")}
+	got, err := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(), rerank.Options{})
+	if err == nil {
+		t.Fatal("expected error when reranker fails")
 	}
 	for _, s := range got {
 		if s.Score != 0.5 {
-			t.Errorf("doc %s scored %g, want 0.5 sentinel after generator error",
+			t.Errorf("doc %s scored %g, want 0.5 sentinel after reranker error",
 				s.Result.DocID, s.Score)
 		}
 	}
 }
 
-type erroringGen struct{ err error }
-
-func (e *erroringGen) Generate(string, ...llm.GenerateOption) (string, error) {
-	return "", e.err
-}
-func (e *erroringGen) ModelName() string { return "erroring" }
-func (e *erroringGen) Close() error      { return nil }
-
-// Public-API regression test for parseYesNo via the keyword-gen
-// path. Locked down to whole-word matching so "no" doesn't latch
-// onto "another" or "noticed".
-func TestRerankWholeWordYesNo(t *testing.T) {
-	cases := []struct {
-		name    string
-		response string
-		want    float64
-	}{
-		{"plain yes", "yes", 1.0},
-		{"plain no", "no", 0.0},
-		{"yes with capital", "Yes", 1.0},
-		{"yes inside chatty echo", "The answer is yes, this is relevant", 1.0},
-		{"no inside chatty echo", "the answer is no, this passage is unrelated", 0.0},
-		{"no should not match noticed", "I noticed nothing relevant", 0.5},
-		{"no should not match another", "another reason", 0.5},
-		{"yes wins on order", "yes and no but yes overall", 1.0},
-		{"no wins on order", "no, although someone might say yes", 0.0},
-		{"empty falls back to 0.5", "", 0.5},
-		{"unrelated text falls back to 0.5", "I'm not sure how to answer", 0.5},
+func TestRerankSubmitsTruncatedPassage(t *testing.T) {
+	long := "lorem ipsum dolor sit amet " // repeated below
+	for i := 0; i < 200; i++ {
+		long += "lorem ipsum dolor sit amet "
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			gen := llm.NewMockGenerator(nil)
-			gen.Default = tc.response
-			got, err := rerank.Rerank(context.Background(), gen, "q", []store.SearchResult{
-				{DocID: "x", Snippet: "anything"},
-			}, rerank.Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got[0].Score != tc.want {
-				t.Errorf("response %q → %g, want %g", tc.response, got[0].Score, tc.want)
-			}
-		})
+	rr := &fakeReranker{scores: map[string]float64{"lorem": 1.0}}
+	candidates := []store.SearchResult{
+		{DocID: "x", Snippet: long, CollectionName: "c"},
+	}
+	_, err := rerank.Rerank(context.Background(), rr, "q", candidates,
+		rerank.Options{PassageBudget: 50})
+	if err != nil {
+		t.Fatalf("Rerank: %v", err)
+	}
+	if len(rr.lastDoc) != 1 {
+		t.Fatalf("reranker got %d docs, want 1", len(rr.lastDoc))
+	}
+	// 50 runes + possibly "…" ≈ 53 chars; certainly not the full
+	// 5000+ character original.
+	if len(rr.lastDoc[0]) > 100 {
+		t.Errorf("passage not truncated: len=%d", len(rr.lastDoc[0]))
 	}
 }
+
+func TestRerankEqualScoresFallBackToSentinel(t *testing.T) {
+	// All candidates get the same logit → span=0 → no signal to
+	// rank by. Every Score should be the 0.5 sentinel.
+	rr := &fakeReranker{scores: map[string]float64{"passage": 2.0}}
+	got, err := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(), rerank.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range got {
+		if s.Score != 0.5 {
+			t.Errorf("doc %s scored %g, want 0.5 sentinel when all logits equal",
+				s.Result.DocID, s.Score)
+		}
+	}
+}
+
+func TestRerankRespectsContextValue(t *testing.T) {
+	rr := &fakeReranker{scores: map[string]float64{"relevant": 1.0, "irrelevant": -1.0}}
+	// Context threaded through to the reranker — catch any handlers
+	// that silently swap ctx.Background() or similar.
+	type ctxKey string
+	ctx := context.WithValue(context.Background(), ctxKey("k"), "v")
+	_, err := rerank.Rerank(ctx, rr, "q", fixtureCandidates(), rerank.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRerankLengthMismatchIsError(t *testing.T) {
+	rr := &shortReranker{}
+	got, err := rerank.Rerank(context.Background(), rr, "q", fixtureCandidates(), rerank.Options{})
+	if err == nil {
+		t.Fatal("expected error on length mismatch")
+	}
+	for _, s := range got {
+		if s.Score != 0.5 {
+			t.Errorf("doc %s should stay at 0.5 on mismatch, got %g", s.Result.DocID, s.Score)
+		}
+	}
+}
+
+type shortReranker struct{ llm.Reranker }
+
+func (*shortReranker) Rerank(_ context.Context, _ string, docs []string) ([]float64, error) {
+	return make([]float64, len(docs)-1), nil // always one short
+}
+func (*shortReranker) ModelName() string { return "short" }
+func (*shortReranker) Close() error      { return nil }

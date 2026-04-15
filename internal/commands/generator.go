@@ -14,12 +14,11 @@ import (
 // building a real local generator.
 var generatorOverride llm.Generator
 
-// rerankGeneratorOverride is the same hook for the reranker model.
-// Expansion and reranking ship with different default models
-// (qmd-query-expansion-1.7B vs Qwen2.5-1.5B-Instruct) because the
-// expansion fine-tune can't follow generic yes/no prompts — see
-// CLAUDE.md "Reranker fallback" for the empirical evidence.
-var rerankGeneratorOverride llm.Generator
+// rerankerOverride lets tests inject a pre-built Reranker for the
+// --rerank path. Pre-v0.2.4 this was a Generator (binary yes/no
+// prompt); v0.2.4 switched to a real cross-encoder via
+// llm.NewLocalReranker + llama-server's /v1/rerank endpoint.
+var rerankerOverride llm.Reranker
 
 // openGenerator returns the LLM Generator implied by the current
 // environment for expansion / HyDE. Today there's only one path —
@@ -51,16 +50,17 @@ func openGenerator() (llm.Generator, error) {
 	return llm.NewLocalGenerator(llm.LocalGeneratorOptions{ModelPath: modelPath})
 }
 
-// openRerankGenerator returns the LLM Generator implied by the
-// current environment for the reranker (--rerank). Same shape as
-// openGenerator but consults RECALL_RERANK_MODEL and the reranker
-// default (Qwen2.5-1.5B-Instruct).
-func openRerankGenerator() (llm.Generator, error) {
-	if rerankGeneratorOverride != nil {
-		return rerankGeneratorOverride, nil
+// openReranker returns the cross-encoder reranker implied by the
+// current environment for --rerank. v0.2.4 switched the reranker
+// from a binary-yes/no Generator (Qwen2.5-1.5B-Instruct) to a real
+// cross-encoder via llm.NewLocalReranker and llama-server's
+// /v1/rerank endpoint (default model: bge-reranker-v2-m3).
+func openReranker() (llm.Reranker, error) {
+	if rerankerOverride != nil {
+		return rerankerOverride, nil
 	}
-	if !llm.LocalGeneratorAvailable() {
-		return nil, llm.ErrLocalGeneratorNotCompiled
+	if !llm.LocalRerankerAvailable() {
+		return nil, llm.ErrLocalRerankerNotAvailable
 	}
 	modelPath, err := embed.ResolveActiveRerankerModelPath()
 	if err != nil {
@@ -73,7 +73,7 @@ func openRerankGenerator() (llm.Generator, error) {
 			modelPath, err,
 		)
 	}
-	return llm.NewLocalGenerator(llm.LocalGeneratorOptions{ModelPath: modelPath})
+	return llm.NewLocalReranker(llm.LocalRerankerOptions{ModelPath: modelPath})
 }
 
 // SetGeneratorOverride is exported for cross-package tests that need
@@ -81,6 +81,6 @@ func openRerankGenerator() (llm.Generator, error) {
 // reaching into private state. Pass nil to clear.
 func SetGeneratorOverride(g llm.Generator) { generatorOverride = g }
 
-// SetRerankGeneratorOverride is the same hook for the reranker
-// generator. Pass nil to clear.
-func SetRerankGeneratorOverride(g llm.Generator) { rerankGeneratorOverride = g }
+// SetRerankerOverride injects a pre-built Reranker for the --rerank
+// path (tests). Pass nil to clear.
+func SetRerankerOverride(r llm.Reranker) { rerankerOverride = r }
