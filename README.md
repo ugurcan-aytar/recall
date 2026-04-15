@@ -95,26 +95,57 @@ To use recall on your own notes, replace `./examples` with `~/notes` (or whereve
 
 recall implements the same retrieval pipeline most modern hybrid search systems use, in pure Go, on top of SQLite. The whole pipeline runs in a single process — no server, no IPC.
 
+The default path (`recall query "<q>"`) is the lean BM25 + vector + RRF flow on the left of the diagram below. The dashed boxes — query expansion, HyDE, and the position-aware reranker — are opt-in via `--expand`, `--hyde`, and `--rerank`. Each opt-in stage gracefully no-ops when its required model isn't available, so the dashed path is never load-bearing.
+
 ```mermaid
 flowchart TD
     Q["<b>query</b><br><i>rate limiter exhaustion</i>"]
+
+    Q -. "<b>--expand</b>" .-> EXP
+    Q -. "<b>--hyde</b>" .-> HYD
+    EXP["<b>expansion LLM</b><br><i>qmd-query-expansion-1.7B</i><br>emits lex / vec / hyde lines"]
+    HYD["<b>hypothetical doc</b><br>embedded as a passage"]
+    EXP -. lex variants .-> BM25
+    EXP -. vec variants .-> VEC
+    HYD -. extra vector query .-> VEC
+
     Q --> BM25
     Q --> VEC
-    subgraph parallel ["parallel goroutines"]
+    subgraph parallel ["parallel goroutines · per-variant fan-out"]
         direction LR
-        BM25["<b>FTS5 BM25</b><br>ranked hits"]
+        BM25["<b>FTS5 BM25</b><br>quoted phrases<br>+ -term negation"]
         VEC["<b>vec0 KNN</b><br>cosine distance"]
     end
+
+    BM25 -. "merge same-side<br>(2× weight on original)" .-> SBM
+    VEC -. "merge same-side<br>(2× weight on original)" .-> SVE
+    SBM["<b>BM25 lists fused</b>"]
+    SVE["<b>vector lists fused</b>"]
+
     BM25 --> RRF
     VEC --> RRF
+    SBM --> RRF
+    SVE --> RRF
+
     RRF["<b>RRF fusion (k=60)</b><br>+ top-rank bonus<br>+ adaptive min-score floor"]
-    RRF --> R["<b>results, ranked</b><br>with <code>--explain</code> trace"]
+
+    RRF --> BLEND
+    RRF -. "<b>--rerank</b>" .-> RER
+    RER["<b>reranker LLM</b><br><i>Qwen2.5-1.5B-Instruct</i><br>yes/no per top-30 candidate"]
+    RER -. binary verdict .-> BLEND
+
+    BLEND{"<b>position-aware blend</b><br>top 1-3: 75/25 RRF/rerank<br>top 4-10: 60/40<br>top 11+: 40/60<br><i>(skipped without --rerank)</i>"}
+    BLEND --> R["<b>results, ranked</b><br>with <code>--explain</code> trace"]
 
     classDef step fill:#fef2f2,stroke:#dc2626,stroke-width:2px,color:#1f2937
     classDef result fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#1f2937
     classDef query fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1f2937
+    classDef llm fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#1f2937,stroke-dasharray:5 3
+    classDef merge fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#1f2937
     class Q query
     class BM25,VEC,RRF step
+    class EXP,HYD,RER llm
+    class SBM,SVE,BLEND merge
     class R result
 ```
 
