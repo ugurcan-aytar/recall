@@ -37,13 +37,15 @@ func (c Chunk) ContentHash() string {
 
 // Tuning knobs.
 //
-// DefaultTargetTokens was 900 in the qmd-inspired R2 design; lowered to
-// 384 in R3+ so chunks comfortably fit small BERT-class embedders
-// (nomic-embed at n_ubatch=512). EstimateTokens uses a words×1.3
-// heuristic that under-counts WordPiece tokens on code and Markdown,
-// so the safety margin matters.
+// DefaultTargetTokens history: 900 (qmd R2) → 384 (R3+, gollama's
+// effective 512 n_ubatch cap) → 768 (v0.2.3+, llama-server subprocess
+// honours -ub = 4096 so the cap that forced 384 is gone). Nomic-embed's
+// training context is 2048; with the words×1.3 estimator under-counting
+// BERT WordPieces by ~2× worst case (see CLAUDE.md "Tuned parameters"),
+// 768 estimated tokens lands comfortably under 2048 actual tokens while
+// giving every chunk more surrounding context to embed against.
 const (
-	DefaultTargetTokens = 384
+	DefaultTargetTokens = 768
 	DefaultOverlapPct   = 0.15
 	windowTokens        = 200
 	tokensPerWord       = 1.3

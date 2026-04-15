@@ -200,8 +200,11 @@ func FormatDocument(title, content string) string {
 //     [NewAPIEmbedder] for that provider. The API key is read from
 //     $OPENAI_API_KEY or $VOYAGE_API_KEY respectively.
 //  2. Otherwise, return [NewLocalEmbedder] rooted at the default model
-//     under [ModelsDir]. When the binary lacks the `embed_llama` tag,
-//     returns [ErrLocalEmbedderNotCompiled].
+//     under [ModelsDir]. When the local embedder can't come up (model
+//     file missing, llama.cpp binary download failed), the returned
+//     error wraps [ErrLocalEmbedderNotCompiled] so callers can treat
+//     every "local embedder unavailable" case uniformly via errors.Is
+//     and fall back to BM25.
 //
 // Callers wanting a custom provider / model / dimensions should skip this
 // helper and call [NewAPIEmbedder] / [NewLocalEmbedder] directly.
@@ -217,10 +220,24 @@ func ResolveEmbedder() (Embedder, error) {
 		return nil, err
 	}
 	if _, err := os.Stat(modelPath); err != nil {
+		// Wrap ErrLocalEmbedderNotCompiled so callers that pattern-match
+		// on it (e.g. brain's Engine.Embedder) treat a missing model the
+		// same as a missing build — both are "local embedding not
+		// available right now, fall back to BM25". Pre-v0.2.2 the
+		// sentinel literally meant "build tag missing"; v0.2.2 dropped
+		// the build-tag gate so the broader "unavailable" reading is the
+		// only one that makes sense today.
 		return nil, fmt.Errorf(
-			"embedding model not found at %s — run `recall models download` or set RECALL_EMBED_MODEL: %w",
-			modelPath, err,
+			"%w: embedding model not found at %s — run `recall models download` or set RECALL_EMBED_MODEL (%v)",
+			ErrLocalEmbedderNotCompiled, modelPath, err,
 		)
 	}
-	return NewLocalEmbedder(LocalEmbedderOptions{ModelPath: modelPath})
+	emb, err := NewLocalEmbedder(LocalEmbedderOptions{ModelPath: modelPath})
+	if err != nil {
+		// Same story for constructor-time failures (binary download,
+		// server boot, dim probe): surface them as "local unavailable"
+		// so brain et al. fall back cleanly.
+		return nil, fmt.Errorf("%w: %v", ErrLocalEmbedderNotCompiled, err)
+	}
+	return emb, nil
 }
