@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ugurcan-aytar/recall/internal/embed"
+	"github.com/ugurcan-aytar/recall/internal/llamacpp"
 )
 
 var doctorCmd = &cobra.Command{
@@ -62,9 +63,19 @@ var doctorCmd = &cobra.Command{
 				warn("embedding model",
 					fmt.Sprintf("%s missing — run `recall models download`", modelPath))
 			}
+			// llama.cpp prebuilt binary status — recall downloads
+			// this on first `recall embed`. Surface its state so the
+			// user knows whether the next embed will fetch ~30 MB.
+			if llamacpp.IsInstalled() {
+				p, _ := llamacpp.ServerPath()
+				pass("llama.cpp binary", p+" ("+llamacpp.Version()+")")
+			} else {
+				warn("llama.cpp binary",
+					"not downloaded yet — recall will fetch the "+llamacpp.Version()+" prebuilt on first `recall embed`")
+			}
 		} else {
 			warn("embedding backend",
-				"local GGUF not compiled in (rebuild with -tags 'sqlite_fts5 embed_llama' or set RECALL_EMBED_PROVIDER=openai|voyage)")
+				"local embedding unavailable on this platform — set RECALL_EMBED_PROVIDER=openai|voyage")
 		}
 
 		if recorded, present, _ := s.GetMetadata("embedding_model"); present && recorded != "" {

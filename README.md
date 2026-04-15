@@ -30,7 +30,7 @@ recall is an on-device search engine for your personal knowledge base — markdo
 - **Vector semantic search** via sqlite-vec — find notes by meaning, not just exact words.
 - **Hybrid fusion** — BM25 and vector results combined with Reciprocal Rank Fusion and an adaptive score floor, so vague queries still surface their best match instead of returning nothing.
 - **Markdown-aware chunking** — 384-token chunks with 15% overlap, scored at natural break-points so headings stay with their bodies.
-- **Local embedding** — a single ~146 MB GGUF model (nomic-embed-text-v1.5, Apache 2.0, ungated) runs in-process. No API calls. No cloud.
+- **Local embedding** — a ~146 MB GGUF model (nomic-embed-text-v1.5, Apache 2.0, ungated) runs via a llama.cpp `llama-server` subprocess on a local Unix socket. No API calls, no cloud — the first `recall embed` auto-fetches the ~40 MB llama.cpp prebuilt into `~/.recall/bin/llamacpp/<version>/`, then everything is offline.
 
 Everything lives in one SQLite file and one Go binary. No servers, no Docker, no Node runtime, no Python runtime.
 
@@ -93,7 +93,7 @@ To use recall on your own notes, replace `./examples` with `~/notes` (or whereve
 
 ## How retrieval works
 
-recall implements the same retrieval pipeline most modern hybrid search systems use, in pure Go, on top of SQLite. The whole pipeline runs in a single process — no server, no IPC.
+recall implements the same retrieval pipeline most modern hybrid search systems use, in pure Go, on top of SQLite. Retrieval (BM25, vector KNN, RRF fusion) runs in-process. Embedding and generation shell out to the official llama.cpp `llama-server` over a local Unix socket — auto-downloaded on first use, no CGo on the inference path.
 
 The default path (`recall query "<q>"`) is the lean BM25 + vector + RRF flow on the left of the diagram below. The dashed boxes — query expansion, HyDE, and the position-aware reranker — are opt-in via `--expand`, `--hyde`, and `--rerank`. Each opt-in stage gracefully no-ops when its required model isn't available, so the dashed path is never load-bearing.
 
@@ -250,7 +250,7 @@ The pieces:
 
 - **store** — `mattn/go-sqlite3` (with the `sqlite_fts5` build tag) plus `asg017/sqlite-vec-go-bindings/cgo`. WAL mode, 64 MB cache, prepared statements cached for the BM25 hot path.
 - **chunk** — markdown break-point scoring is the default. Code files route through `smacker/go-tree-sitter` for AST-aware cuts. Strategy is overridable via `--chunk-strategy auto|regex|ast`.
-- **embed** — local GGUF via `dianlight/gollama.cpp` is the default. The library is purego (no CGo for inference) and downloads its platform-specific llama.cpp shared library on first use to `~/.cache/gollama/libs/` (~100 MB, one-time). After that, the binary keeps the model loaded across the run for amortised load cost. BM25-only commands never load the model. Optional API fallback (`RECALL_EMBED_PROVIDER=openai|voyage`) is opt-in only and never default.
+- **embed** — local GGUF via the official llama.cpp prebuilt `llama-server` binary running as a subprocess on a Unix socket. recall downloads the platform-appropriate llama.cpp release on first `recall embed` (~30-40 MB, one-time, into `~/.recall/bin/llamacpp/<version>/`), spawns it with `--embedding`, and talks to `/v1/embeddings` (OpenAI-compatible batch input) over the socket. The model loads once for the lifetime of the embed run; HTTP round-trips on a local socket are negligible. BM25-only commands never start a subprocess. Optional API fallback (`RECALL_EMBED_PROVIDER=openai|voyage`) is opt-in only and never default.
 - **pkg/recall** — a stable facade (`NewEngine`, `SearchBM25`, `SearchVector`, `SearchHybrid`, `Index`, `Embed`, `Get`, …) that external Go consumers import.
 
 ## Installation
@@ -304,7 +304,7 @@ recall query "your question"
 
 `RECALL_EMBED_PROVIDER` defaults to `local`, so the API path is opt-in only — recall never sends data anywhere unless you explicitly set the env var.
 
-**Pre-built binaries include local GGUF embedding.** No source build needed. The first `recall embed` (or `recall query --expand|--rerank|--hyde`) downloads the platform llama.cpp shared library (~100 MB) into `~/.cache/gollama/libs/`, after which everything runs offline. Use `recall models download` to fetch the embedding model itself; `--expansion` and `--reranker` add the LLMs for the optional flags.
+**Pre-built binaries include local embedding AND local generation.** No source build needed. On the first `recall embed`, recall downloads the official llama.cpp prebuilt `llama-server` (~30-40 MB) into `~/.recall/bin/llamacpp/<version>/` and the embedding model itself (use `recall models download` for that — ~146 MB for nomic-embed). Generation features (`--expand` / `--rerank` / `--hyde`) talk to the same binary via a separate subprocess per model: `recall models download --expansion` (~1.3 GB) and `recall models download --reranker` (~1.1 GB). After the first run everything is offline.
 
 Run `recall doctor` any time to see which backend the current binary will use.
 
@@ -447,12 +447,13 @@ The flag is opt-in for the same reasons as `--expand`: separate
 ≈ 2 s per query). Without the flag the query path stays untouched.
 
 **A note on quality**: ideally we'd use a true cross-encoder
-(Qwen3-Reranker-0.6B with `--pooling rank`), but gollama doesn't
-expose llama.cpp's rank-pooling surface yet. Until it does, recall
-falls back to a binary-yes/no instruct prompt — empirical POC
-showed 5/5 correct discrimination on a realistic 5-doc corpus.
-When gollama gains the rank API, recall will drop in the actual
-reranker model without breaking the flag's contract.
+(Qwen3-Reranker-0.6B with `--pooling rank`), but llama.cpp's
+rank-pooling endpoint isn't yet exposed by `llama-server`.
+Until it is, recall uses an instruct model (Qwen2.5-1.5B) with
+a binary yes/no prompt — empirical POC showed 5/5 correct
+discrimination on a realistic 5-doc corpus. When llama-server
+ships rank pooling, recall will drop in the actual reranker
+model without breaking the flag's contract.
 
 **Position-aware blending**: the binary verdict alone would throw
 away the RRF signal. Instead, recall combines the two scores with
