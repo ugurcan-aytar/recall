@@ -53,6 +53,15 @@ func WithDBPath(path string) Option {
 	return func(c *config) { c.dbPath = path }
 }
 
+// ResolveIndexPath maps a --index name to its ~/.recall/indexes/<name>.db
+// file path. Library consumers (brain) use it to share the same
+// named-index convention the CLI's --index flag enforces. Name
+// sanitisation: alphanumerics, dash, underscore only — no path
+// separators, no "..". See [store.ResolveIndexPath] for the full doc.
+func ResolveIndexPath(name string) (string, error) {
+	return store.ResolveIndexPath(name)
+}
+
 // NewEngine opens (or creates) the database and prepares the engine.
 func NewEngine(opts ...Option) (*Engine, error) {
 	cfg := &config{}

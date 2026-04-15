@@ -29,7 +29,7 @@ recall is an on-device search engine for your personal knowledge base — markdo
 - **BM25 full-text search** via SQLite FTS5 — fast, deterministic keyword matching.
 - **Vector semantic search** via sqlite-vec — find notes by meaning, not just exact words.
 - **Hybrid fusion** — BM25 and vector results combined with Reciprocal Rank Fusion and an adaptive score floor, so vague queries still surface their best match instead of returning nothing.
-- **Markdown-aware chunking** — 384-token chunks with 15% overlap, scored at natural break-points so headings stay with their bodies.
+- **Markdown-aware chunking** — 900-token chunks with 15% overlap, scored at natural break-points so headings stay with their bodies.
 - **Local embedding** — a ~146 MB GGUF model (nomic-embed-text-v1.5, Apache 2.0, ungated) runs via a llama.cpp `llama-server` subprocess on a local Unix socket. No API calls, no cloud — the first `recall embed` auto-fetches the ~40 MB llama.cpp prebuilt into `~/.recall/bin/llamacpp/<version>/`, then everything is offline.
 
 Everything lives in one SQLite file and one Go binary. No servers, no Docker, no Node runtime, no Python runtime.
@@ -190,7 +190,7 @@ Documents bigger than the target are split with break-point scoring: H1 = 100, H
 
 For source files (`.go`, `.py`, `.ts`, `.js`, `.java`, `.rs`) the chunker uses `tree-sitter` to cut at function / method / class / impl / import boundaries instead. Languages without a tree-sitter grammar fall back to the markdown chunker silently.
 
-Default target is **384 estimated tokens** (chunked content fits comfortably under typical BERT-class embedder context windows). Override with `--chunk-strategy` on `recall embed`.
+Default target is **900 estimated tokens** (nomic-embed-text-v1.5's training context is 2048; the words×1.3 estimator under-counts BERT WordPieces by ~2× worst-case, leaving comfortable margin). Pre-v0.2.7 the target was 384, pinned by the in-process backend's 512-token `n_ubatch` cap; the subprocess pattern removed that cap. Override with `--chunk-strategy` on `recall embed`.
 
 ### Incremental re-embedding
 
@@ -213,6 +213,11 @@ When you edit a file and re-run `recall index`, only the chunks whose `content_h
 | `recall vsearch "<query>"` | Vector semantic search |
 | `recall query "<query>"` | Hybrid: BM25 + vector + RRF fusion |
 | `recall query "<query>" --explain` | Hybrid + per-result RRF / bonus / floor / rank trace |
+| `recall query "<query>" --expand` | Query expansion via qmd-query-expansion-1.7B — lex + vec variants searched in parallel, merged |
+| `recall query "<query>" --hyde` | Hypothetical Document Embedding — LLM writes an "ideal answer," recall embeds it as an extra vector probe |
+| `recall query "<query>" --rerank` | Cross-encoder rerank top-30 via bge-reranker-v2-m3, position-aware blend with RRF |
+| `recall --index <name> ...` | Use a named isolated index at `~/.recall/indexes/<name>.db` instead of the default DB |
+| `recall bench <file.jsonl>` | Retrieval quality benchmark — precision@k, recall@k, MRR across `bm25 \| vector \| hybrid` modes |
 | `recall get <path \| #docid>` | Retrieve a single document |
 | `recall multi-get <pattern>` | Batch retrieve by glob or list |
 | `recall context add [path] "text"` | Add descriptive context for a path |
