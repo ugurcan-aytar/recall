@@ -337,18 +337,25 @@ func applyRerank(fused []store.FusedResult, q string) []store.FusedResult {
 		return fused
 	}
 
-	// rerank.Rerank returns Scored values sorted by Score desc with
-	// RRFRank as the tiebreaker. Map back to FusedResult by docKey
-	// so we keep the trace data the explain path needs.
+	// Position-aware blend (feature #5): each candidate's final
+	// score is BlendBands-weighted between RRF rank and the binary
+	// reranker verdict. Top-3 RRF positions get a 75/25 weighting,
+	// ranks 4-10 get 60/40, ranks 11+ get 40/60. This protects
+	// strong RRF hits when the reranker is uncertain while still
+	// letting a confident reranker promote deep candidates.
+	blended := rerank.PositionAwareBlend(scored, rerank.DefaultBlendBands)
+
+	// Map back to FusedResult, keeping the original RRF trace so
+	// `--explain` still has bm25/vec rank info per row.
 	traceByKey := map[string]store.FusionTrace{}
 	for _, f := range fused {
 		traceByKey[f.DocID] = f.Trace
 	}
-	out := make([]store.FusedResult, len(scored))
-	for i, s := range scored {
+	out := make([]store.FusedResult, len(blended))
+	for i, s := range blended {
 		out[i] = store.FusedResult{
 			SearchResult: s.Result,
-			FusedScore:   s.Score,
+			FusedScore:   s.BlendedScore,
 			Trace:        traceByKey[s.Result.DocID],
 		}
 	}

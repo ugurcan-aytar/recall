@@ -10,6 +10,7 @@ import (
 	"github.com/ugurcan-aytar/recall/internal/embed"
 	"github.com/ugurcan-aytar/recall/internal/expand"
 	"github.com/ugurcan-aytar/recall/internal/llm"
+	"github.com/ugurcan-aytar/recall/internal/rerank"
 )
 
 // Generator is recall's text-generation contract. See [llm.Generator]
@@ -79,6 +80,18 @@ const (
 func ResolveActiveRerankerModelPath() (string, error) {
 	return embed.ResolveActiveRerankerModelPath()
 }
+
+// BlendBands lets external consumers retune the position-aware
+// reranker blend (--rerank). DefaultRerankBlendBands matches qmd:
+// 75/25 for ranks 0-2, 60/40 for 3-9, 40/60 for 10+.
+type BlendBands = rerank.BlendBands
+
+// BlendBand is one rank-range entry in BlendBands.
+type BlendBand = rerank.BlendBand
+
+// DefaultRerankBlendBands is the qmd-mirrored default. Document
+// any change as a semver-minor event.
+var DefaultRerankBlendBands = rerank.DefaultBlendBands
 
 // Expanded is the parsed result of [Expand]. Lex / Vec / Hyde slices
 // hold the model's variants for each retrieval surface; Original is

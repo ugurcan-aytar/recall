@@ -58,14 +58,18 @@ const PromptTemplate = `Does the passage answer the query? Reply with exactly on
 Query: %s
 Passage: %s`
 
-// Scored pairs an input candidate with its 0.0 / 1.0 rerank verdict.
-// RRFRank is the original 0-based rank in the input slice — kept so
-// the position-aware blender (feature #5) can fuse it with the
-// rerank score.
+// Scored pairs an input candidate with its 0.0 / 1.0 rerank verdict
+// (Score) and the position-aware fused result (BlendedScore).
+// RRFRank is the original 0-based rank in the input slice — used by
+// [PositionAwareBlend] to pick the rerank-vs-rank weight band.
+//
+// BlendedScore is zero until PositionAwareBlend has been called;
+// callers that don't run the blender can sort by Score directly.
 type Scored struct {
-	Result   store.SearchResult
-	Score    float64
-	RRFRank  int
+	Result       store.SearchResult
+	Score        float64
+	BlendedScore float64
+	RRFRank      int
 }
 
 // Options tweaks one Rerank call.
@@ -119,7 +123,7 @@ func Rerank(ctx context.Context, gen llm.Generator, query string, candidates []s
 
 	out := make([]Scored, len(candidates))
 	for i, c := range candidates {
-		out[i] = Scored{Result: c, Score: 0.5, RRFRank: i}
+		out[i] = Scored{Result: c, Score: 0.5, BlendedScore: 0, RRFRank: i}
 	}
 
 	scoreOne := func(i int) {

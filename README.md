@@ -390,6 +390,17 @@ showed 5/5 correct discrimination on a realistic 5-doc corpus.
 When gollama gains the rank API, recall will drop in the actual
 reranker model without breaking the flag's contract.
 
+**Position-aware blending**: the binary verdict alone would throw
+away the RRF signal. Instead, recall combines the two scores with
+weights that depend on the candidate's RRF rank — top-3 hits get
+a 75/25 RRF/reranker mix, ranks 4-10 get 60/40, ranks 11+ get
+40/60. The effect: a strong RRF hit the reranker disagrees with
+still scores ~0.75 (so RRF protects high-confidence retrieval),
+while a deep-tail candidate the reranker confidently approves can
+land near the top (so the reranker can still rescue good
+recall-misses). Brain-style consumers can retune the bands via
+`recall.DefaultRerankBlendBands`.
+
 ### Speeding up `recall embed` with parallel workers
 
 By default `recall embed` runs one chunk through the model at a time —

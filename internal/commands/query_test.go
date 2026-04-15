@@ -77,39 +77,62 @@ func TestRunExpansionWithoutModelDegrades(t *testing.T) {
 	}
 }
 
-// TestApplyRerankReordersByScore verifies the rerank wire-up:
-// inject a keyword-based MockGenerator that returns "yes" iff the
-// passage contains "match" and "no" otherwise, hand applyRerank a
-// 3-doc fused list, and confirm the matching docs land on top with
-// FusedScore = 1.0.
-func TestApplyRerankReordersByScore(t *testing.T) {
+// TestApplyRerankReordersByBlendedScore verifies the
+// rerank → position-aware blend wire-up. With six candidates and
+// a keyword-based MockGenerator that returns "yes" for the matching
+// half, the blend's "RRF protects top + reranker corrects deep"
+// shape collapses to: yes-and-top-RRF wins, no-and-tail-RRF loses.
+func TestApplyRerankReordersByBlendedScore(t *testing.T) {
 	gen := &keywordYesNoGen{}
 	SetRerankGeneratorOverride(gen)
 	t.Cleanup(func() { SetRerankGeneratorOverride(nil) })
 
+	// Top 3 RRF positions are "match" (yes), bottom 3 are not (no).
 	in := []store.FusedResult{
-		{SearchResult: store.SearchResult{DocID: "x", Path: "x.md", Snippet: "no signal here", CollectionName: "c"}, FusedScore: 0.8},
-		{SearchResult: store.SearchResult{DocID: "y", Path: "y.md", Snippet: "this is the match passage", CollectionName: "c"}, FusedScore: 0.6},
-		{SearchResult: store.SearchResult{DocID: "z", Path: "z.md", Snippet: "another match here", CollectionName: "c"}, FusedScore: 0.4},
+		{SearchResult: store.SearchResult{DocID: "y0", Snippet: "match passage A", CollectionName: "c"}, FusedScore: 0.9},
+		{SearchResult: store.SearchResult{DocID: "y1", Snippet: "another match here", CollectionName: "c"}, FusedScore: 0.8},
+		{SearchResult: store.SearchResult{DocID: "y2", Snippet: "match passage C", CollectionName: "c"}, FusedScore: 0.7},
+		{SearchResult: store.SearchResult{DocID: "n3", Snippet: "no signal here", CollectionName: "c"}, FusedScore: 0.6},
+		{SearchResult: store.SearchResult{DocID: "n4", Snippet: "irrelevant text", CollectionName: "c"}, FusedScore: 0.5},
+		{SearchResult: store.SearchResult{DocID: "n5", Snippet: "definitely not", CollectionName: "c"}, FusedScore: 0.4},
 	}
 	out := applyRerank(in, "q")
-	if len(out) != 3 {
-		t.Fatalf("len = %d, want 3", len(out))
+	if len(out) != 6 {
+		t.Fatalf("len = %d, want 6", len(out))
 	}
-	if out[0].DocID != "y" && out[0].DocID != "z" {
-		t.Errorf("first = %s, want y or z (the matching docs)", out[0].DocID)
+	// The three "yes" docs all carry the top-3 RRF rank AND the
+	// top reranker verdict, so they should claim the top 3 blended
+	// positions. Order within can shuffle by tie.
+	yesSet := map[string]struct{}{"y0": {}, "y1": {}, "y2": {}}
+	for i := 0; i < 3; i++ {
+		if _, ok := yesSet[out[i].DocID]; !ok {
+			t.Errorf("blended position %d = %s, want one of y0/y1/y2", i, out[i].DocID)
+		}
 	}
-	if out[2].DocID != "x" {
-		t.Errorf("last = %s, want x (no match)", out[2].DocID)
+	// And the three "no" docs should occupy the bottom three.
+	noSet := map[string]struct{}{"n3": {}, "n4": {}, "n5": {}}
+	for i := 3; i < 6; i++ {
+		if _, ok := noSet[out[i].DocID]; !ok {
+			t.Errorf("blended position %d = %s, want one of n3/n4/n5", i, out[i].DocID)
+		}
 	}
-	// Matching docs get FusedScore overwritten to 1.0; non-match to 0.0.
+	// FusedScore must now hold the BLENDED value, not the raw
+	// rerank verdict. Top-of-list y0 (RRFRank 0 + yes) should
+	// score 1.0; bottom-of-list n5 (RRFRank 5 + no) should be near 0.
+	var topY0, bottomN5 float64
 	for _, r := range out {
-		if r.DocID == "x" && r.FusedScore != 0 {
-			t.Errorf("x FusedScore = %g, want 0", r.FusedScore)
+		if r.DocID == "y0" {
+			topY0 = r.FusedScore
 		}
-		if (r.DocID == "y" || r.DocID == "z") && r.FusedScore != 1 {
-			t.Errorf("%s FusedScore = %g, want 1", r.DocID, r.FusedScore)
+		if r.DocID == "n5" {
+			bottomN5 = r.FusedScore
 		}
+	}
+	if topY0 != 1.0 {
+		t.Errorf("y0 blended = %g, want 1.0", topY0)
+	}
+	if bottomN5 != 0 {
+		t.Errorf("n5 blended = %g, want 0 (RRFRank 5 + no on a 6-doc set)", bottomN5)
 	}
 }
 
