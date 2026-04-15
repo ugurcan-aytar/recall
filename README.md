@@ -131,8 +131,8 @@ flowchart TD
 
     RRF --> BLEND
     RRF -. "<b>--rerank</b>" .-> RER
-    RER["<b>reranker LLM</b><br><i>Qwen2.5-1.5B-Instruct</i><br>yes/no per top-30 candidate"]
-    RER -. binary verdict .-> BLEND
+    RER["<b>cross-encoder reranker</b><br><i>bge-reranker-v2-m3</i><br>batched /v1/rerank · top-30 candidates"]
+    RER -. continuous logits<br>(min-max normalised) .-> BLEND
 
     BLEND{"<b>position-aware blend</b><br>top 1-3: 75/25 RRF/rerank<br>top 4-10: 60/40<br>top 11+: 40/60<br><i>(skipped without --rerank)</i>"}
     BLEND --> R["<b>results, ranked</b><br>with <code>--explain</code> trace"]
@@ -419,16 +419,15 @@ that. An explicit `--intent` flag still wins over the auto-fill.
 
 ### Reranking (`--rerank`)
 
-`--rerank` sends the top-N RRF results through a small instruction-
-tuned LLM that answers a binary "does this passage answer the
-query?" question per candidate. Yes-answers float to the top, no-
-answers sink. The verdict is binary (1.0 / 0.0); fine-grained
-ordering inside each bucket is preserved by stable sort, so the
-RRF rank survives as a tiebreaker.
+`--rerank` sends the top-N RRF results through a cross-encoder
+reranker that scores every (query, passage) pair directly and
+returns a continuous relevance logit per candidate. The scores
+are min-max normalised into [0, 1] within the candidate set,
+then fused with RRF rank via the position-aware blender below.
 
 ```sh
-# One-time: download the reranker model (Qwen2.5-1.5B-Instruct,
-# Apache 2.0, ungated, ~1.1 GB).
+# One-time: download the reranker model (bge-reranker-v2-m3,
+# Apache 2.0, ungated, ~418 MB at Q4_K_M).
 recall models download --reranker
 
 # Use the flag on any hybrid query.
@@ -441,29 +440,30 @@ recall query --expand --rerank "what did the team decide about authentication"
 recall query --rerank --rerank-top-n 50 "..."
 ```
 
-The flag is opt-in for the same reasons as `--expand`: separate
-~1.1 GB download, and one LLM-inference call per candidate
-(measured ~70 ms per call on a modern laptop, so 30 candidates
-≈ 2 s per query). Without the flag the query path stays untouched.
+The flag is opt-in because of the extra ~418 MB download. At
+runtime the reranker is one batched HTTP call against
+`llama-server`'s `/v1/rerank` endpoint — typical cost is 1-2 s
+total for 30 candidates on Apple Silicon (model load + single
+round-trip). Without the flag the query path stays untouched.
 
-**A note on quality**: ideally we'd use a true cross-encoder
-(Qwen3-Reranker-0.6B with `--pooling rank`), but llama.cpp's
-rank-pooling endpoint isn't yet exposed by `llama-server`.
-Until it is, recall uses an instruct model (Qwen2.5-1.5B) with
-a binary yes/no prompt — empirical POC showed 5/5 correct
-discrimination on a realistic 5-doc corpus. When llama-server
-ships rank pooling, recall will drop in the actual reranker
-model without breaking the flag's contract.
+**Why bge-reranker-v2-m3?** It's the reference model llama.cpp
+PR #9510 used when it added reranking support to
+`libllama`/`llama-server`/`llama-embedding`. Apache 2.0, 568 M
+params, multilingual, explicitly supported via the
+`--reranking` flag. Continuous logits in practice span roughly
+[-12, +8] — real gradient signal, unlike the binary yes/no
+prompt fallback recall shipped pre-v0.2.4.
 
-**Position-aware blending**: the binary verdict alone would throw
-away the RRF signal. Instead, recall combines the two scores with
-weights that depend on the candidate's RRF rank — top-3 hits get
-a 75/25 RRF/reranker mix, ranks 4-10 get 60/40, ranks 11+ get
-40/60. The effect: a strong RRF hit the reranker disagrees with
-still scores ~0.75 (so RRF protects high-confidence retrieval),
-while a deep-tail candidate the reranker confidently approves can
-land near the top (so the reranker can still rescue good
-recall-misses). Brain-style consumers can retune the bands via
+**Position-aware blending**: raw cross-encoder logits alone
+would throw away the RRF signal. Instead, recall normalises
+the logits into [0,1] and combines them with RRF rank using
+weights that depend on the candidate's RRF rank — top-3 hits
+get a 75/25 RRF/reranker mix, ranks 4-10 get 60/40, ranks 11+
+get 40/60. A strong RRF hit the reranker disagrees with still
+scores ~0.75 (RRF protects high-confidence retrieval), while a
+deep-tail candidate the reranker confidently approves can land
+near the top (reranker rescues good recall-misses). Brain-style
+consumers can retune the bands via
 `recall.DefaultRerankBlendBands`.
 
 ### Speeding up `recall embed` with parallel workers
